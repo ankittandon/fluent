@@ -1,0 +1,19 @@
+{
+  "name": "@screamer/web",
+  "version": "0.1.0",
+  "description": "Experimental Screamer browser SDK for push-to-talk voice control in web apps.",
+  "type": "module",
+  "sideEffects": false,
+  "files": [
+    "src",
+    "README.md"
+  ],
+  "exports": {
+    ".": {
+      "types": "./src/index.d.ts",
+      "import": "./src/index.js"
+    }
+  },
+  "types": "./src/index.d.ts",
+  "license": "MIT"
+}

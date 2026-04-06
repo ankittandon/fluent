@@ -1,0 +1,110 @@
+[package]
+name = "screamer"
+version = "1.0.0"
+edition = "2021"
+description = "Offline push-to-talk speech-to-text app for macOS"
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/suvamsh/screamer"
+homepage = "https://github.com/suvamsh/screamer"
+rust-version = "1.94"
+publish = false
+
+[workspace]
+members = [
+    ".",
+    "crates/screamer-core",
+    "crates/screamer-models",
+    "crates/screamer-whisper",
+]
+
+[dependencies]
+cpal = "0.15"
+objc2 = "0.6"
+block2 = "0.6"
+whisper-rs = { version = "0.14", features = ["metal"] }
+objc2-foundation = { version = "0.3", features = [
+    "NSDate",
+    "NSString",
+    "NSTimer",
+    "NSThread",
+    "NSRunLoop",
+    "NSNotification",
+    "NSValue",
+    "NSRange",
+    "NSGeometry",
+    "NSArray",
+] }
+objc2-core-foundation = { version = "0.3", features = [
+    "CFCGTypes",
+] }
+objc2-app-kit = { version = "0.3", features = [
+    "NSApplication",
+    "NSStatusBar",
+    "NSStatusItem",
+    "NSStatusBarButton",
+    "NSMenu",
+    "NSMenuItem",
+    "NSPanel",
+    "NSWindow",
+    "NSView",
+    "NSVisualEffectView",
+    "NSColor",
+    "NSTextField",
+    "NSImage",
+    "NSPasteboard",
+    "NSAnimationContext",
+    "NSAnimation",
+    "NSScreen",
+    "NSGraphicsContext",
+    "NSGraphics",
+    "NSBezierPath",
+    "NSFont",
+    "NSFontDescriptor",
+    "NSEvent",
+    "NSAlert",
+    "NSRunningApplication",
+    "NSResponder",
+    "NSText",
+    "NSControl",
+    "NSButton",
+    "NSImageView",
+    "NSPopUpButton",
+    "NSSearchField",
+    "NSProgressIndicator",
+    "NSParagraphStyle",
+    "NSScrollView",
+    "NSSwitch",
+    "NSSegmentedControl",
+    "NSAppearance",
+    "NSTextView",
+    "NSWindowScripting",
+    "NSSound",
+] }
+objc2-quartz-core = { version = "0.3", features = ["CALayer"] }
+core-graphics = "0.24"
+core-foundation = "0.10"
+arboard = "3"
+screamer-core = { path = "crates/screamer-core" }
+screamer-models = { path = "crates/screamer-models" }
+screamer-whisper = { path = "crates/screamer-whisper" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+dirs = "6"
+libc = "0.2"
+log = "0.4"
+oslog = "0.2"
+rusqlite = { version = "0.32", features = ["bundled"] }
+llama_cpp_2 = { package = "llama-cpp-2", version = "0.1.141", default-features = false, features = ["metal", "mtmd"] }
+
+[build-dependencies]
+cc = "1"
+
+[patch.crates-io]
+whisper-rs-sys = { path = "patches/whisper-rs-sys" }
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true
+codegen-units = 1

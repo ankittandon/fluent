@@ -1,0 +1,634 @@
+use crate::config::Config;
+use crate::recorder::Recorder;
+use crate::session_store::{SessionDetail, SessionStore};
+use crate::summary_backend::SummaryBackendRegistry;
+use screamer_core::ambient::{
+    chunk_len_samples, chunk_step_samples, merge_segment, stitch_text, AmbientSessionConfig,
+    AmbientSessionState, AudioLane, CanonicalSegment, DiarizationEngine, DiarizationRequest,
+    DiarizedSegment, SummaryTemplate, TranscriptSegment,
+};
+use screamer_core::audio::TARGET_SAMPLE_RATE;
+use screamer_core::session::{prepare_final_transcription, FinalTranscriptionAction};
+use screamer_whisper::Transcriber;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+const MIN_CHUNK_PROCESS_SAMPLES: usize = TARGET_SAMPLE_RATE as usize * 2;
+
+#[derive(Clone, Debug)]
+pub struct AmbientSessionSnapshot {
+    pub id: i64,
+    pub title: String,
+    pub state: AmbientSessionState,
+    pub started_at_ms: i64,
+    pub ended_at_ms: Option<i64>,
+    pub live_notes: String,
+    pub structured_notes: String,
+    pub transcript_markdown: String,
+    pub scratch_pad: String,
+    pub segments: Vec<CanonicalSegment>,
+    pub warning: Option<String>,
+    pub microphone_enabled: bool,
+    pub system_audio_requested: bool,
+    pub system_audio_active: bool,
+    pub summary_backend_label: String,
+    pub summary_template: SummaryTemplate,
+    pub elapsed_ms: u64,
+}
+
+pub struct AmbientController {
+    store: Arc<SessionStore>,
+    transcriber: Arc<Transcriber>,
+    summary_registry: Arc<SummaryBackendRegistry>,
+    diarization_engine: Arc<dyn DiarizationEngine>,
+    runtime: Mutex<Option<RuntimeSession>>,
+}
+
+struct RuntimeSession {
+    session_id: i64,
+    started_at: Instant,
+    stop_signal: Arc<AtomicBool>,
+    snapshot: Arc<Mutex<AmbientSessionSnapshot>>,
+    worker: Option<JoinHandle<()>>,
+}
+
+struct ProcessState {
+    processed_until: usize,
+    next_segment_id: u64,
+}
+
+impl AmbientController {
+    pub fn new(
+        store: Arc<SessionStore>,
+        transcriber: Arc<Transcriber>,
+        summary_registry: Arc<SummaryBackendRegistry>,
+        diarization_engine: Arc<dyn DiarizationEngine>,
+    ) -> Self {
+        Self {
+            store,
+            transcriber,
+            summary_registry,
+            diarization_engine,
+            runtime: Mutex::new(None),
+        }
+    }
+
+    pub fn system_audio_runtime_supported(&self) -> bool {
+        false
+    }
+
+    pub fn system_audio_runtime_reason(&self) -> &'static str {
+        "System output capture is gated for a newer backend build; microphone ambient capture is available now."
+    }
+
+    pub fn start_session(&self, config: &Config) -> Result<i64, String> {
+        let mut runtime = self
+            .runtime
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if runtime.is_some() {
+            return Err("An ambient session is already running.".to_string());
+        }
+
+        let ambient_config = AmbientSessionConfig {
+            enable_microphone: config.ambient_microphone,
+            enable_system_audio: config.ambient_system_audio,
+            ..AmbientSessionConfig::default()
+        };
+        if !ambient_config.enable_microphone && !ambient_config.enable_system_audio {
+            return Err(
+                "Enable microphone or system audio in Settings before starting notetaker."
+                    .to_string(),
+            );
+        }
+
+        let summary_backend_label = if config.summary_backend_label().is_empty() {
+            "Bundled Gemma 3 1B".to_string()
+        } else {
+            config.summary_backend_label().to_string()
+        };
+        let session_id = self
+            .store
+            .create_session("Ambient session", &summary_backend_label)?;
+        let warning =
+            if ambient_config.enable_system_audio && !self.system_audio_runtime_supported() {
+                Some(self.system_audio_runtime_reason().to_string())
+            } else {
+                None
+            };
+        let snapshot = Arc::new(Mutex::new(AmbientSessionSnapshot {
+            id: session_id,
+            title: "Ambient session".to_string(),
+            state: AmbientSessionState::Recording,
+            started_at_ms: unix_ms(),
+            ended_at_ms: None,
+            live_notes: String::new(),
+            structured_notes: String::new(),
+            transcript_markdown: String::new(),
+            scratch_pad: String::new(),
+            segments: Vec::new(),
+            warning,
+            microphone_enabled: ambient_config.enable_microphone,
+            system_audio_requested: ambient_config.enable_system_audio,
+            system_audio_active: false,
+            summary_backend_label: summary_backend_label.clone(),
+            summary_template: SummaryTemplate::General,
+            elapsed_ms: 0,
+        }));
+        let stop_signal = Arc::new(AtomicBool::new(false));
+        let worker = spawn_runtime_worker(
+            session_id,
+            ambient_config,
+            config.clone(),
+            self.store.clone(),
+            self.transcriber.clone(),
+            self.summary_registry.clone(),
+            self.diarization_engine.clone(),
+            snapshot.clone(),
+            stop_signal.clone(),
+        );
+
+        *runtime = Some(RuntimeSession {
+            session_id,
+            started_at: Instant::now(),
+            stop_signal,
+            snapshot,
+            worker: Some(worker),
+        });
+        Ok(session_id)
+    }
+
+    pub fn stop_session(&self) -> Result<(), String> {
+        let runtime = self
+            .runtime
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(session) = runtime.as_ref() else {
+            return Err("No active ambient session.".to_string());
+        };
+
+        session.stop_signal.store(true, Ordering::SeqCst);
+        if let Ok(mut snapshot) = session.snapshot.lock() {
+            snapshot.state = AmbientSessionState::Processing;
+        }
+        self.store
+            .update_state(session.session_id, AmbientSessionState::Processing, None)?;
+        Ok(())
+    }
+
+    pub fn tick(&self) {
+        let mut runtime = self
+            .runtime
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(session) = runtime.as_mut() else {
+            return;
+        };
+
+        let worker_finished = session
+            .worker
+            .as_ref()
+            .map(|handle| handle.is_finished())
+            .unwrap_or(false);
+
+        if let Ok(mut snapshot) = session.snapshot.lock() {
+            snapshot.elapsed_ms = session.started_at.elapsed().as_millis() as u64;
+        }
+
+        if worker_finished {
+            if let Some(worker) = session.worker.take() {
+                let _ = worker.join();
+            }
+            *runtime = None;
+        }
+    }
+
+    pub fn active_snapshot(&self) -> Option<AmbientSessionSnapshot> {
+        let runtime = self
+            .runtime
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let session = runtime.as_ref()?;
+        session
+            .snapshot
+            .lock()
+            .ok()
+            .map(|snapshot| snapshot.clone())
+    }
+
+    pub fn load_session(&self, session_id: i64) -> Result<Option<AmbientSessionSnapshot>, String> {
+        if let Some(active) = self.active_snapshot() {
+            if active.id == session_id {
+                return Ok(Some(active));
+            }
+        }
+
+        let detail = self.store.load_session(session_id)?;
+        Ok(detail.map(snapshot_from_detail))
+    }
+
+    pub fn persist_live_notes(&self, session_id: i64, live_notes: &str) -> Result<(), String> {
+        if let Some(active) = self.active_snapshot() {
+            if active.id == session_id {
+                let runtime = self
+                    .runtime
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if let Some(session) = runtime.as_ref() {
+                    if let Ok(mut snapshot) = session.snapshot.lock() {
+                        snapshot.live_notes.clear();
+                        snapshot.live_notes.push_str(live_notes);
+                    }
+                }
+            }
+        }
+        self.store.update_live_notes(session_id, live_notes)
+    }
+
+    pub fn set_summary_template(
+        &self,
+        session_id: i64,
+        template: SummaryTemplate,
+    ) -> Result<(), String> {
+        if let Some(active) = self.active_snapshot() {
+            if active.id == session_id {
+                let runtime = self
+                    .runtime
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if let Some(session) = runtime.as_ref() {
+                    if let Ok(mut snapshot) = session.snapshot.lock() {
+                        snapshot.summary_template = template;
+                    }
+                }
+            }
+        }
+        self.store.update_summary_template(session_id, template)
+    }
+
+    pub fn persist_scratch_pad(&self, session_id: i64, scratch_pad: &str) -> Result<(), String> {
+        if let Some(active) = self.active_snapshot() {
+            if active.id == session_id {
+                let runtime = self
+                    .runtime
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if let Some(session) = runtime.as_ref() {
+                    if let Ok(mut snapshot) = session.snapshot.lock() {
+                        snapshot.scratch_pad.clear();
+                        snapshot.scratch_pad.push_str(scratch_pad);
+                    }
+                }
+            }
+        }
+        self.store.update_scratch_pad(session_id, scratch_pad)
+    }
+}
+
+fn spawn_runtime_worker(
+    session_id: i64,
+    ambient_config: AmbientSessionConfig,
+    app_config: Config,
+    store: Arc<SessionStore>,
+    transcriber: Arc<Transcriber>,
+    summary_registry: Arc<SummaryBackendRegistry>,
+    diarization_engine: Arc<dyn DiarizationEngine>,
+    snapshot: Arc<Mutex<AmbientSessionSnapshot>>,
+    stop_signal: Arc<AtomicBool>,
+) -> JoinHandle<()> {
+    std::thread::spawn(move || {
+        let recorder = if ambient_config.enable_microphone {
+            let recorder = Arc::new(Recorder::new());
+            match recorder.start() {
+                Ok(()) => Some(recorder),
+                Err(err) => {
+                    let _ = store.update_state(
+                        session_id,
+                        AmbientSessionState::Failed,
+                        Some(unix_ms()),
+                    );
+                    if let Ok(mut state) = snapshot.lock() {
+                        state.state = AmbientSessionState::Failed;
+                        state.warning = Some(format!("Unable to start microphone capture: {err}"));
+                    }
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+
+        let mut process_state = ProcessState {
+            processed_until: 0,
+            next_segment_id: 1,
+        };
+
+        while !stop_signal.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(1_200));
+            if let Some(recorder) = &recorder {
+                let snapshot_samples = recorder.snapshot();
+                let _ = process_audio_snapshot(
+                    session_id,
+                    &ambient_config,
+                    &transcriber,
+                    &*diarization_engine,
+                    &store,
+                    &snapshot,
+                    &snapshot_samples,
+                    &mut process_state,
+                );
+            }
+        }
+
+        if let Some(recorder) = &recorder {
+            let final_samples = recorder.stop();
+            let _ = process_audio_snapshot(
+                session_id,
+                &ambient_config,
+                &transcriber,
+                &*diarization_engine,
+                &store,
+                &snapshot,
+                &final_samples,
+                &mut process_state,
+            );
+        }
+
+        let (live_notes, segments, scratch_pad, summary_template) = {
+            let state = snapshot
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            (
+                state.live_notes.clone(),
+                state.segments.clone(),
+                state.scratch_pad.clone(),
+                state.summary_template,
+            )
+        };
+        let summarizer = summary_registry.summarizer_for_config(&app_config);
+        let title = summary_registry.concise_session_title(&app_config, &live_notes, &segments);
+        let notes_with_scratch = if scratch_pad.trim().is_empty() {
+            live_notes.clone()
+        } else {
+            format!(
+                "--- User Notes (Scratch Pad) ---\n{}\n--- End User Notes ---\n\n{}",
+                scratch_pad, live_notes
+            )
+        };
+        let structured_notes = summarizer
+            .summarize(
+                &notes_with_scratch,
+                &segments,
+                Some(&title),
+                summary_template,
+            )
+            .map(|notes| notes.to_markdown())
+            .unwrap_or_else(|err| {
+                format!("## Summary\n\n{}\n\n## Key Points\n\n- {}\n", title, err)
+            });
+        let transcript_markdown = screamer_core::ambient::segments_to_transcript(&segments);
+
+        let final_state = if structured_notes.is_empty() {
+            AmbientSessionState::Failed
+        } else {
+            AmbientSessionState::Completed
+        };
+        let ended_at = unix_ms();
+        let _ = store.update_structured_notes(
+            session_id,
+            &title,
+            &structured_notes,
+            &transcript_markdown,
+        );
+        let _ = store.update_state(session_id, final_state, Some(ended_at));
+
+        if let Ok(mut state) = snapshot.lock() {
+            state.title = title;
+            state.state = final_state;
+            state.structured_notes = structured_notes;
+            state.transcript_markdown = transcript_markdown;
+            state.ended_at_ms = Some(ended_at);
+            state.elapsed_ms = state
+                .ended_at_ms
+                .map(|ended_at_ms| ended_at_ms.saturating_sub(state.started_at_ms) as u64)
+                .unwrap_or(state.elapsed_ms);
+        }
+    })
+}
+
+fn process_audio_snapshot(
+    session_id: i64,
+    ambient_config: &AmbientSessionConfig,
+    transcriber: &Transcriber,
+    diarization_engine: &dyn DiarizationEngine,
+    store: &SessionStore,
+    snapshot: &Arc<Mutex<AmbientSessionSnapshot>>,
+    samples: &[f32],
+    process_state: &mut ProcessState,
+) -> Result<(), String> {
+    if samples.len().saturating_sub(process_state.processed_until) < MIN_CHUNK_PROCESS_SAMPLES {
+        return Ok(());
+    }
+
+    let chunk_len = chunk_len_samples(ambient_config.chunk_seconds, TARGET_SAMPLE_RATE as usize);
+    let step = chunk_step_samples(
+        ambient_config.chunk_seconds,
+        ambient_config.overlap_seconds,
+        TARGET_SAMPLE_RATE as usize,
+    )
+    .max(MIN_CHUNK_PROCESS_SAMPLES);
+
+    let existing_segments = {
+        let state = snapshot
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.segments.clone()
+    };
+    let mut merged_segments = existing_segments.clone();
+    let mut did_change = false;
+
+    while samples.len().saturating_sub(process_state.processed_until) >= MIN_CHUNK_PROCESS_SAMPLES {
+        let end = (process_state.processed_until + step).min(samples.len());
+        let start = end.saturating_sub(chunk_len);
+        let window = &samples[start..end];
+
+        match prepare_final_transcription(window) {
+            FinalTranscriptionAction::Ready(window_bounds) => {
+                let transcribe_range = window_bounds.range;
+                let chunk = &window[transcribe_range.clone()];
+                let detailed = transcriber.transcribe_detailed_profiled(chunk)?;
+                let chunk_start_ms = samples_to_ms(start + transcribe_range.start);
+                let chunk_end_ms = samples_to_ms(start + transcribe_range.end);
+                let transcript_segments =
+                    transcript_segments_from_decode(AudioLane::Microphone, chunk, &detailed);
+                if !transcript_segments.is_empty() {
+                    let diarized = diarization_engine.diarize(DiarizationRequest {
+                        lane: AudioLane::Microphone,
+                        sample_rate_hz: TARGET_SAMPLE_RATE as usize,
+                        chunk_start_ms,
+                        chunk_end_ms,
+                        samples: chunk,
+                        transcript_segments: &transcript_segments,
+                        previous_segments: &merged_segments,
+                    });
+                    did_change |= integrate_diarized_segments(
+                        &mut merged_segments,
+                        &diarized,
+                        &mut process_state.next_segment_id,
+                    );
+                }
+            }
+            FinalTranscriptionAction::SkipSilence
+            | FinalTranscriptionAction::SkipTooShort { .. } => {}
+        }
+
+        process_state.processed_until = end;
+        if end == samples.len() {
+            break;
+        }
+    }
+
+    if !did_change {
+        return Ok(());
+    }
+
+    if let Some(updated_tail) = updated_existing_tail(&existing_segments, &merged_segments) {
+        store.update_last_segment(session_id, updated_tail)?;
+    }
+
+    if merged_segments.len() > existing_segments.len() {
+        store.append_segments(session_id, &merged_segments[existing_segments.len()..])?;
+    }
+
+    let live_notes = screamer_core::ambient::segments_to_transcript(&merged_segments);
+    let transcript_markdown = live_notes.clone();
+
+    let mut state = snapshot
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    state.live_notes = live_notes.clone();
+    state.segments = merged_segments;
+    state.transcript_markdown = transcript_markdown;
+
+    store.update_live_notes(session_id, &live_notes)?;
+    Ok(())
+}
+
+fn transcript_segments_from_decode(
+    lane: AudioLane,
+    samples: &[f32],
+    detailed: &screamer_whisper::DetailedTranscriptionOutput,
+) -> Vec<TranscriptSegment> {
+    let mut segments = detailed
+        .segments
+        .iter()
+        .map(|segment| TranscriptSegment {
+            lane,
+            start_ms: segment.start_ms,
+            end_ms: segment.end_ms,
+            speaker_turn_next: segment.speaker_turn_next,
+            text: segment.text.clone(),
+        })
+        .collect::<Vec<_>>();
+
+    if segments.is_empty() && !detailed.text.trim().is_empty() {
+        segments.push(TranscriptSegment {
+            lane,
+            start_ms: 0,
+            end_ms: samples_to_ms(samples.len()).max(1),
+            speaker_turn_next: false,
+            text: detailed.text.trim().to_string(),
+        });
+    }
+
+    segments
+}
+
+fn integrate_diarized_segments(
+    segments: &mut Vec<CanonicalSegment>,
+    diarized: &[DiarizedSegment],
+    next_segment_id: &mut u64,
+) -> bool {
+    let mut changed = false;
+
+    for segment in diarized {
+        let stitched = segments
+            .last()
+            .map(|last| stitch_text(&last.text, &segment.text))
+            .unwrap_or_else(|| segment.text.clone());
+        if stitched.trim().is_empty() {
+            continue;
+        }
+
+        let candidate = CanonicalSegment {
+            id: *next_segment_id,
+            lane: segment.lane,
+            speaker: segment.speaker,
+            start_ms: segment.start_ms,
+            end_ms: segment.end_ms,
+            text: stitched.trim().to_string(),
+        };
+
+        let len_before = segments.len();
+        let tail_before = segments.last().cloned();
+        if merge_segment(segments, candidate).is_some() {
+            if segments.len() > len_before {
+                *next_segment_id += 1;
+                changed = true;
+            } else if segments.last() != tail_before.as_ref() {
+                changed = true;
+            }
+        }
+    }
+
+    changed
+}
+
+fn updated_existing_tail<'a>(
+    previous: &'a [CanonicalSegment],
+    current: &'a [CanonicalSegment],
+) -> Option<&'a CanonicalSegment> {
+    let index = previous.len().checked_sub(1)?;
+    let previous_tail = previous.get(index)?;
+    let current_tail = current.get(index)?;
+    (previous_tail != current_tail).then_some(current_tail)
+}
+
+fn snapshot_from_detail(detail: SessionDetail) -> AmbientSessionSnapshot {
+    let elapsed_ms = detail
+        .ended_at_ms
+        .map(|ended_at_ms| ended_at_ms.saturating_sub(detail.started_at_ms) as u64)
+        .unwrap_or_else(|| unix_ms().saturating_sub(detail.started_at_ms) as u64);
+    AmbientSessionSnapshot {
+        id: detail.id,
+        title: detail.title,
+        state: detail.state,
+        started_at_ms: detail.started_at_ms,
+        ended_at_ms: detail.ended_at_ms,
+        live_notes: detail.live_notes,
+        structured_notes: detail.structured_notes,
+        transcript_markdown: detail.transcript_markdown,
+        scratch_pad: detail.scratch_pad,
+        segments: detail.segments,
+        warning: None,
+        microphone_enabled: true,
+        system_audio_requested: true,
+        system_audio_active: false,
+        summary_backend_label: "Bundled Gemma 3 1B".to_string(),
+        summary_template: detail.summary_template,
+        elapsed_ms,
+    }
+}
+
+fn unix_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+fn samples_to_ms(samples: usize) -> u64 {
+    (samples as u64 * 1_000) / TARGET_SAMPLE_RATE as u64
+}
