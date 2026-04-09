@@ -10,10 +10,10 @@ mod diarization;
 use ambient_final_pass::{
     run_native_diarization_final_pass, run_whisperx_hybrid_final_pass, AmbientFinalPassResult,
 };
-use serde::{Deserialize, Serialize};
 use screamer_core::ambient::{segments_to_transcript, AmbientSessionConfig, CanonicalSegment};
 use screamer_core::audio::{resample_to_target, TARGET_SAMPLE_RATE};
 use screamer_whisper::{MachineProfile, Transcriber};
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -117,20 +117,19 @@ fn main() {
 
 fn run() -> Result<(), String> {
     let options = parse_options(std::env::args().skip(1))?;
-    let manifest: EvalManifest = serde_json::from_str(
-        &fs::read_to_string(&options.manifest_path).map_err(|err| {
+    let manifest: EvalManifest =
+        serde_json::from_str(&fs::read_to_string(&options.manifest_path).map_err(|err| {
             format!(
                 "Failed to read manifest {}: {err}",
                 options.manifest_path.display()
             )
-        })?,
-    )
-    .map_err(|err| {
-        format!(
-            "Failed to parse manifest {}: {err}",
-            options.manifest_path.display()
-        )
-    })?;
+        })?)
+        .map_err(|err| {
+            format!(
+                "Failed to parse manifest {}: {err}",
+                options.manifest_path.display()
+            )
+        })?;
 
     let model_path = Transcriber::find_model(&manifest.model).ok_or_else(|| {
         format!(
@@ -180,7 +179,10 @@ fn run() -> Result<(), String> {
             let _ = fs::remove_file(&audio_wav);
             result
         } else {
-            Err("Legacy Python benchmark disabled. Pass --enable-legacy-python to run it.".to_string())
+            Err(
+                "Legacy Python benchmark disabled. Pass --enable-legacy-python to run it."
+                    .to_string(),
+            )
         };
 
         let reference_summary = EvalReferenceSummary {
@@ -323,7 +325,10 @@ fn read_audio_file(path: &Path) -> Result<Vec<f32>, String> {
         hound::SampleFormat::Float => {
             for sample in reader.samples::<f32>() {
                 raw_samples.push(sample.map_err(|err| {
-                    format!("Failed to read float WAV sample from {}: {err}", path.display())
+                    format!(
+                        "Failed to read float WAV sample from {}: {err}",
+                        path.display()
+                    )
                 })?);
             }
         }
@@ -332,7 +337,10 @@ fn read_audio_file(path: &Path) -> Result<Vec<f32>, String> {
             for sample in reader.samples::<i32>() {
                 raw_samples.push(
                     sample.map_err(|err| {
-                        format!("Failed to read PCM WAV sample from {}: {err}", path.display())
+                        format!(
+                            "Failed to read PCM WAV sample from {}: {err}",
+                            path.display()
+                        )
                     })? as f32
                         / scale.max(1.0),
                 );
@@ -378,11 +386,15 @@ fn build_segment_report(
         turn_count: Some(segments.len()),
         speaker_count: Some(unique_speaker_count(&segments)),
         speaker_count_delta: reference_turns.map(|turns| {
-            unique_speaker_count(&segments) as isize - unique_reference_speaker_count(turns) as isize
+            unique_speaker_count(&segments) as isize
+                - unique_reference_speaker_count(turns) as isize
         }),
-        turn_count_delta: reference_turns.map(|turns| segments.len() as isize - turns.len() as isize),
-        word_error_rate: reference_transcript.map(|reference| word_error_rate(reference, &plain_text)),
-        turn_boundary_f1_500ms: reference_turns.map(|turns| turn_boundary_f1(turns, &segments, 500)),
+        turn_count_delta: reference_turns
+            .map(|turns| segments.len() as isize - turns.len() as isize),
+        word_error_rate: reference_transcript
+            .map(|reference| word_error_rate(reference, &plain_text)),
+        turn_boundary_f1_500ms: reference_turns
+            .map(|turns| turn_boundary_f1(turns, &segments, 500)),
         speaker_time_accuracy: reference_turns.map(|turns| speaker_time_accuracy(turns, &segments)),
         total_ms: Some(total_ms),
         real_time_factor: Some(real_time_factor(total_ms, audio_duration_ms)),
@@ -478,7 +490,10 @@ fn build_final_pass_report_with_elapsed(
 }
 
 fn unique_speaker_count(segments: &[CanonicalSegment]) -> usize {
-    let mut speakers = segments.iter().map(|segment| segment.speaker).collect::<Vec<_>>();
+    let mut speakers = segments
+        .iter()
+        .map(|segment| segment.speaker)
+        .collect::<Vec<_>>();
     speakers.sort_by_key(|speaker| speaker.index());
     speakers.dedup();
     speakers.len()
@@ -537,7 +552,11 @@ fn word_error_rate(reference: &str, hypothesis: &str) -> f64 {
     dp[reference_words.len()][hypothesis_words.len()] as f64 / reference_words.len() as f64
 }
 
-fn turn_boundary_f1(reference_turns: &[ReferenceTurn], segments: &[CanonicalSegment], tolerance_ms: u64) -> f64 {
+fn turn_boundary_f1(
+    reference_turns: &[ReferenceTurn],
+    segments: &[CanonicalSegment],
+    tolerance_ms: u64,
+) -> f64 {
     let reference_boundaries = reference_turns
         .iter()
         .skip(1)
@@ -621,18 +640,20 @@ fn speaker_time_accuracy(reference_turns: &[ReferenceTurn], segments: &[Canonica
                 .iter()
                 .filter(|turn| &turn.speaker == reference_speaker)
                 .flat_map(|turn| {
-                    segments.iter().filter(move |segment| &segment.speaker == predicted_speaker).map(
-                        move |segment| {
+                    segments
+                        .iter()
+                        .filter(move |segment| &segment.speaker == predicted_speaker)
+                        .map(move |segment| {
                             overlap_ms(turn.start_ms, turn.end_ms, segment.start_ms, segment.end_ms)
-                        },
-                    )
+                        })
                 })
                 .sum::<u64>();
             overlaps[reference_index][predicted_index] = overlap;
         }
     }
 
-    let best_overlap = best_overlap_assignment(&overlaps, 0, 0, &mut vec![false; predicted_speakers.len()]);
+    let best_overlap =
+        best_overlap_assignment(&overlaps, 0, 0, &mut vec![false; predicted_speakers.len()]);
     let total_reference_ms = reference_turns
         .iter()
         .map(|turn| turn.end_ms.saturating_sub(turn.start_ms))
@@ -652,7 +673,8 @@ fn best_overlap_assignment(
         return current_total;
     }
 
-    let mut best = best_overlap_assignment(overlaps, reference_index + 1, current_total, used_predicted);
+    let mut best =
+        best_overlap_assignment(overlaps, reference_index + 1, current_total, used_predicted);
     for predicted_index in 0..used_predicted.len() {
         if used_predicted[predicted_index] {
             continue;
@@ -734,7 +756,10 @@ mod tests {
                 speaker: "B".to_string(),
             },
         ];
-        let predicted = vec![segment(0, 1_000, SpeakerLabel::S1), segment(1_000, 2_000, SpeakerLabel::S2)];
+        let predicted = vec![
+            segment(0, 1_000, SpeakerLabel::S1),
+            segment(1_000, 2_000, SpeakerLabel::S2),
+        ];
 
         assert_eq!(turn_boundary_f1(&reference, &predicted, 500), 1.0);
     }
@@ -753,7 +778,10 @@ mod tests {
                 speaker: "Bob".to_string(),
             },
         ];
-        let predicted = vec![segment(0, 1_000, SpeakerLabel::S2), segment(1_000, 2_000, SpeakerLabel::S1)];
+        let predicted = vec![
+            segment(0, 1_000, SpeakerLabel::S2),
+            segment(1_000, 2_000, SpeakerLabel::S1),
+        ];
 
         assert_eq!(speaker_time_accuracy(&reference, &predicted), 1.0);
     }

@@ -30,10 +30,9 @@ impl VoiceDiarizationEngine {
         segment_start_ms: u64,
         segment_end_ms: u64,
     ) -> &'a [f32] {
-        let start_idx = (segment_start_ms as usize * sample_rate_hz / 1000)
-            .min(chunk_samples.len());
-        let end_idx = (segment_end_ms as usize * sample_rate_hz / 1000)
-            .min(chunk_samples.len());
+        let start_idx =
+            (segment_start_ms as usize * sample_rate_hz / 1000).min(chunk_samples.len());
+        let end_idx = (segment_end_ms as usize * sample_rate_hz / 1000).min(chunk_samples.len());
         &chunk_samples[start_idx..end_idx]
     }
 }
@@ -59,7 +58,11 @@ impl DiarizationEngine for VoiceDiarizationEngine {
         let mut prev_speaker_turn_next = false;
 
         for segment in request.transcript_segments {
-            let text = segment.text.split_whitespace().collect::<Vec<_>>().join(" ");
+            let text = segment
+                .text
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
             if text.is_empty() {
                 continue;
             }
@@ -111,11 +114,7 @@ mod tests {
             .collect()
     }
 
-    fn transcript(
-        start_ms: u64,
-        end_ms: u64,
-        text: &str,
-    ) -> TranscriptSegment {
+    fn transcript(start_ms: u64, end_ms: u64, text: &str) -> TranscriptSegment {
         TranscriptSegment {
             lane: AudioLane::Microphone,
             start_ms,

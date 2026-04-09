@@ -434,7 +434,10 @@ mod tests {
         assert!(config.sound_effects);
         assert!(config.ambient_microphone);
         assert!(config.ambient_system_audio);
-        assert_eq!(config.ambient_final_backend, AmbientFinalBackendPreference::Native);
+        assert_eq!(
+            config.ambient_final_backend,
+            AmbientFinalBackendPreference::Native
+        );
         assert_eq!(config.summary_backend, SummaryBackendPreference::Bundled);
         assert_eq!(config.summary_ollama_model, "gemma4:latest");
         assert!(config.show_accessibility_helper_on_launch);
@@ -492,7 +495,10 @@ mod tests {
         assert!(config.sound_effects);
         assert!(config.ambient_microphone);
         assert!(config.ambient_system_audio);
-        assert_eq!(config.ambient_final_backend, AmbientFinalBackendPreference::Native);
+        assert_eq!(
+            config.ambient_final_backend,
+            AmbientFinalBackendPreference::Native
+        );
         assert_eq!(config.summary_backend, SummaryBackendPreference::Bundled);
         assert_eq!(config.summary_ollama_model, "gemma4:latest");
         assert!(config.show_accessibility_helper_on_launch);

@@ -1,12 +1,13 @@
 use crate::ambient_controller::AmbientController;
 use crate::branding;
 use crate::config::{
-    AmbientFinalBackendPreference, AppAppearance, Config, AMBIENT_FINAL_BACKENDS, HOTKEYS,
-    MODELS, POSITIONS,
+    AmbientFinalBackendPreference, AppAppearance, Config, AMBIENT_FINAL_BACKENDS, HOTKEYS, MODELS,
+    POSITIONS,
 };
 use crate::session_store::{SessionStore, SessionSummary};
 use crate::summary_backend::{SummaryBackendRegistry, SummaryModelOption};
 use crate::theme;
+use libc::{localtime_r, strftime, time_t};
 use objc2::msg_send;
 use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
@@ -21,6 +22,7 @@ use objc2_core_foundation::{CGFloat, CGPoint, CGRect, CGSize};
 use objc2_foundation::{MainThreadMarker, NSString};
 use screamer_core::ambient::{CanonicalSegment, SummaryTemplate};
 use std::cell::{Cell, RefCell};
+use std::ffi::CStr;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -49,7 +51,10 @@ pub struct MainWindow {
     home_view: Retained<NSView>,
     home_banner: Retained<NSTextField>,
     home_dictation_hint: Retained<NSTextField>,
+    home_backend_hint: Retained<NSTextField>,
+    home_composer_hint: Retained<NSTextField>,
     home_primary_button: Retained<NSButton>,
+    home_quick_note_button: Retained<NSButton>,
     home_recent_container: Retained<NSView>,
     session_view: Retained<NSView>,
     session_title: Retained<NSTextField>,
@@ -60,6 +65,7 @@ pub struct MainWindow {
     session_stop_button: Retained<NSButton>,
     scratch_pad_scroll: Retained<NSScrollView>,
     scratch_pad_text: Retained<NSTextView>,
+    session_activity_heading: Retained<NSTextField>,
     transcript_scroll: Retained<NSScrollView>,
     transcript_container: Retained<NSView>,
     session_template_popup: Retained<NSPopUpButton>,
@@ -274,174 +280,133 @@ impl MainWindow {
         home_view.setFrame(content_bounds());
         content_host.addSubview(&home_view);
 
+        let home_quick_note_button = action_button(
+            mtm,
+            CGRect::new(
+                CGPoint::new(WINDOW_WIDTH - SIDEBAR_WIDTH - 154.0, WINDOW_HEIGHT - 66.0),
+                CGSize::new(124.0, 34.0),
+            ),
+            "Quick note",
+            handler,
+            sel!(openOrStartAmbientSession:),
+        );
+        home_view.addSubview(&home_quick_note_button);
+
         let home_heading = text_label(
             mtm,
-            "Capture notes without the clutter",
+            "Coming up",
             CGRect::new(
-                CGPoint::new(CONTENT_PADDING, WINDOW_HEIGHT - 112.0),
-                CGSize::new(760.0, 44.0),
+                CGPoint::new(72.0, WINDOW_HEIGHT - 112.0),
+                CGSize::new(320.0, 34.0),
             ),
-            34.0,
+            22.0,
             &theme::title_text(config.appearance),
             true,
         );
         home_view.addSubview(&home_heading);
 
-        let home_banner = text_label(
-            mtm,
-            "",
-            CGRect::new(
-                CGPoint::new(CONTENT_PADDING, WINDOW_HEIGHT - 148.0),
-                CGSize::new(860.0, 24.0),
-            ),
-            14.0,
-            &theme::secondary_text(config.appearance),
-            false,
-        );
-        home_view.addSubview(&home_banner);
-
         let home_card = surface_view(
             mtm,
             CGRect::new(
-                CGPoint::new(CONTENT_PADDING, WINDOW_HEIGHT - 356.0),
-                CGSize::new(610.0, 172.0),
+                CGPoint::new(68.0, WINDOW_HEIGHT - 292.0),
+                CGSize::new(560.0, 156.0),
             ),
             &theme::surface_background(config.appearance),
             &theme::card_border(config.appearance),
-            22.0,
+            24.0,
         );
         home_view.addSubview(&home_card);
 
-        let home_logo_badge = surface_view(
-            mtm,
-            CGRect::new(CGPoint::new(28.0, 42.0), CGSize::new(88.0, 88.0)),
-            &theme::window_background(config.appearance),
-            &theme::card_border(config.appearance),
-            44.0,
-        );
-        home_card.addSubview(&home_logo_badge);
-        if let Some(logo) = branding::load_logo(mtm) {
-            let logo_view = NSImageView::imageViewWithImage(&logo, mtm);
-            logo_view.setFrame(CGRect::new(
-                CGPoint::new(38.0, 52.0),
-                CGSize::new(68.0, 68.0),
-            ));
-            logo_view.setImageScaling(NSImageScaling::ScaleProportionallyUpOrDown);
-            home_card.addSubview(&logo_view);
+        for y in [104.0, 52.0] {
+            let separator = surface_view(
+                mtm,
+                CGRect::new(CGPoint::new(22.0, y), CGSize::new(516.0, 1.0)),
+                &theme::card_border(config.appearance),
+                &theme::card_border(config.appearance),
+                0.0,
+            );
+            home_card.addSubview(&separator);
         }
 
-        let home_card_title = text_label(
-            mtm,
-            "Start an ambient session",
-            CGRect::new(CGPoint::new(140.0, 112.0), CGSize::new(300.0, 26.0)),
-            24.0,
-            &theme::title_text(config.appearance),
-            true,
-        );
-        home_card.addSubview(&home_card_title);
-
-        let home_card_body = wrapped_text_label(
-            mtm,
-            "Capture the conversation, clean up the notes, and leave with a concise local summary.",
-            CGRect::new(CGPoint::new(140.0, 76.0), CGSize::new(306.0, 34.0)),
-            13.0,
-            &theme::secondary_text(config.appearance),
-            false,
-        );
-        home_card.addSubview(&home_card_body);
-
-        for (index, label) in ["Offline", "Whisper", "Gemma"].iter().enumerate() {
-            let badge = badge_view(
+        for (index, label) in ["Now", "Capture", "Output"].iter().enumerate() {
+            let title = text_label(
                 mtm,
                 label,
                 CGRect::new(
-                    CGPoint::new(140.0 + index as f64 * 96.0, 30.0),
-                    CGSize::new(84.0, 30.0),
+                    CGPoint::new(24.0, 120.0 - index as f64 * 52.0),
+                    CGSize::new(88.0, 18.0),
                 ),
-                config.appearance,
+                12.0,
+                &theme::secondary_text(config.appearance),
+                true,
             );
-            home_card.addSubview(&badge);
+            home_card.addSubview(&title);
         }
 
-        let home_primary_button = primary_button(
+        let home_banner = wrapped_text_label(
             mtm,
-            CGRect::new(CGPoint::new(454.0, 30.0), CGSize::new(126.0, 42.0)),
-            "Start session",
-            handler,
-            sel!(startAmbientSession:),
-        );
-        home_card.addSubview(&home_primary_button);
-
-        let dictation_card = surface_view(
-            mtm,
-            CGRect::new(
-                CGPoint::new(CONTENT_PADDING + 634.0, WINDOW_HEIGHT - 356.0),
-                CGSize::new(360.0, 172.0),
-            ),
-            &theme::surface_background(config.appearance),
-            &theme::card_border(config.appearance),
-            22.0,
-        );
-        home_view.addSubview(&dictation_card);
-
-        let dictation_accent = surface_view(
-            mtm,
-            CGRect::new(CGPoint::new(24.0, 120.0), CGSize::new(10.0, 10.0)),
-            &theme::brand_gold(),
-            &theme::brand_gold(),
-            5.0,
-        );
-        dictation_card.addSubview(&dictation_accent);
-
-        let dictation_title = text_label(
-            mtm,
-            "Dictate anywhere",
-            CGRect::new(CGPoint::new(24.0, 104.0), CGSize::new(260.0, 24.0)),
-            22.0,
+            "",
+            CGRect::new(CGPoint::new(126.0, 110.0), CGSize::new(390.0, 26.0)),
+            13.0,
             &theme::title_text(config.appearance),
-            true,
+            false,
         );
-        dictation_card.addSubview(&dictation_title);
+        home_card.addSubview(&home_banner);
 
         let home_dictation_hint = wrapped_text_label(
             mtm,
             "",
-            CGRect::new(CGPoint::new(24.0, 64.0), CGSize::new(304.0, 34.0)),
+            CGRect::new(CGPoint::new(126.0, 58.0), CGSize::new(390.0, 26.0)),
             13.0,
             &theme::secondary_text(config.appearance),
             false,
         );
-        dictation_card.addSubview(&home_dictation_hint);
+        home_card.addSubview(&home_dictation_hint);
 
-        let dictation_footer = text_label(
+        let home_backend_hint = wrapped_text_label(
             mtm,
-            "Hold to speak. Release to paste.",
-            CGRect::new(CGPoint::new(24.0, 28.0), CGSize::new(280.0, 16.0)),
-            12.0,
+            "",
+            CGRect::new(CGPoint::new(126.0, 6.0), CGSize::new(390.0, 30.0)),
+            13.0,
             &theme::secondary_text(config.appearance),
             false,
         );
-        dictation_card.addSubview(&dictation_footer);
-
-        let recent_heading = text_label(
-            mtm,
-            "Recent sessions",
-            CGRect::new(
-                CGPoint::new(CONTENT_PADDING, WINDOW_HEIGHT - 412.0),
-                CGSize::new(300.0, 24.0),
-            ),
-            18.0,
-            &theme::title_text(config.appearance),
-            true,
-        );
-        home_view.addSubview(&recent_heading);
+        home_card.addSubview(&home_backend_hint);
 
         let home_recent_container = NSView::new(mtm);
         home_recent_container.setFrame(CGRect::new(
-            CGPoint::new(CONTENT_PADDING, 54.0),
-            CGSize::new(988.0, WINDOW_HEIGHT - 476.0),
+            CGPoint::new(68.0, 96.0),
+            CGSize::new(560.0, 440.0),
         ));
         home_view.addSubview(&home_recent_container);
+
+        let home_composer = surface_view(
+            mtm,
+            CGRect::new(CGPoint::new(40.0, 28.0), CGSize::new(780.0, 58.0)),
+            &theme::surface_background(config.appearance),
+            &theme::card_border(config.appearance),
+            29.0,
+        );
+        home_view.addSubview(&home_composer);
+
+        let home_composer_hint = text_label(
+            mtm,
+            "",
+            CGRect::new(CGPoint::new(22.0, 19.0), CGSize::new(520.0, 20.0)),
+            14.0,
+            &theme::secondary_text(config.appearance),
+            false,
+        );
+        home_composer.addSubview(&home_composer_hint);
+
+        let home_primary_button = primary_button(
+            mtm,
+            CGRect::new(CGPoint::new(612.0, 11.0), CGSize::new(146.0, 36.0)),
+            "Start session",
+            handler,
+            sel!(openOrStartAmbientSession:),
+        );
+        home_composer.addSubview(&home_primary_button);
 
         let session_view = NSView::new(mtm);
         session_view.setFrame(content_bounds());
@@ -525,52 +490,61 @@ impl MainWindow {
         );
         session_view.addSubview(&session_stop_button);
 
-        let scratch_pad_heading = text_label(
-            mtm,
-            "Scratch pad",
-            CGRect::new(
-                CGPoint::new(CONTENT_PADDING, WINDOW_HEIGHT - 218.0),
-                CGSize::new(280.0, 22.0),
-            ),
-            18.0,
-            &theme::title_text(config.appearance),
-            true,
-        );
-        session_view.addSubview(&scratch_pad_heading);
-
-        let scratch_pad_top = WINDOW_HEIGHT - 410.0;
-        let (scratch_pad_scroll, scratch_pad_text) = editor_scroll_view(
+        let session_workspace_width = WINDOW_WIDTH - SIDEBAR_WIDTH - CONTENT_PADDING * 2.0;
+        let session_workspace_height = WINDOW_HEIGHT - 280.0;
+        let session_workspace = surface_view(
             mtm,
             CGRect::new(
-                CGPoint::new(CONTENT_PADDING, scratch_pad_top),
-                CGSize::new(588.0, 166.0),
-            ),
-            config.appearance,
-            true,
-        );
-        session_view.addSubview(&scratch_pad_scroll);
-
-        let transcript_heading = text_label(
-            mtm,
-            "Live transcription",
-            CGRect::new(
-                CGPoint::new(CONTENT_PADDING, scratch_pad_top - 34.0),
-                CGSize::new(280.0, 22.0),
-            ),
-            18.0,
-            &theme::title_text(config.appearance),
-            true,
-        );
-        session_view.addSubview(&transcript_heading);
-
-        let transcript_area_height = scratch_pad_top - 34.0 - 12.0 - 60.0;
-        let transcript_scroll = {
-            let frame = CGRect::new(
                 CGPoint::new(CONTENT_PADDING, 60.0),
-                CGSize::new(588.0, transcript_area_height),
-            );
+                CGSize::new(session_workspace_width, session_workspace_height),
+            ),
+            &theme::surface_background(config.appearance),
+            &theme::card_border(config.appearance),
+            22.0,
+        );
+        session_view.addSubview(&session_workspace);
+
+        let notes_heading = text_label(
+            mtm,
+            "Notes",
+            CGRect::new(
+                CGPoint::new(24.0, session_workspace_height - 42.0),
+                CGSize::new(220.0, 22.0),
+            ),
+            18.0,
+            &theme::title_text(config.appearance),
+            true,
+        );
+        session_workspace.addSubview(&notes_heading);
+
+        let notes_editor_frame = CGRect::new(
+            CGPoint::new(24.0, 24.0),
+            CGSize::new(644.0, session_workspace_height - 78.0),
+        );
+        let (scratch_pad_scroll, scratch_pad_text) =
+            editor_scroll_view(mtm, notes_editor_frame, config.appearance, true);
+        session_workspace.addSubview(&scratch_pad_scroll);
+
+        let session_activity_heading = text_label(
+            mtm,
+            "Live transcript",
+            CGRect::new(
+                CGPoint::new(694.0, session_workspace_height - 42.0),
+                CGSize::new(160.0, 22.0),
+            ),
+            18.0,
+            &theme::title_text(config.appearance),
+            true,
+        );
+        session_workspace.addSubview(&session_activity_heading);
+
+        let activity_panel_frame = CGRect::new(
+            CGPoint::new(694.0, 24.0),
+            CGSize::new(304.0, session_workspace_height - 78.0),
+        );
+        let transcript_scroll = {
             let scroll = NSScrollView::new(mtm);
-            scroll.setFrame(frame);
+            scroll.setFrame(activity_panel_frame);
             scroll.setHasVerticalScroller(true);
             scroll.setBorderType(NSBorderType::NoBorder);
             scroll.setDrawsBackground(false);
@@ -585,29 +559,19 @@ impl MainWindow {
         let transcript_container = NSView::new(mtm);
         transcript_container.setFrame(CGRect::new(
             CGPoint::new(0.0, 0.0),
-            CGSize::new(588.0, transcript_area_height),
+            CGSize::new(
+                activity_panel_frame.size.width,
+                activity_panel_frame.size.height,
+            ),
         ));
         transcript_scroll.setDocumentView(Some(&transcript_container));
-        session_view.addSubview(&transcript_scroll);
-
-        let structured_heading = text_label(
-            mtm,
-            "Summary",
-            CGRect::new(
-                CGPoint::new(CONTENT_PADDING + 618.0, WINDOW_HEIGHT - 218.0),
-                CGSize::new(120.0, 22.0),
-            ),
-            18.0,
-            &theme::title_text(config.appearance),
-            true,
-        );
-        session_view.addSubview(&structured_heading);
+        session_workspace.addSubview(&transcript_scroll);
 
         let session_template_popup = popup_button(
             mtm,
             CGRect::new(
-                CGPoint::new(CONTENT_PADDING + 618.0 + 130.0, WINDOW_HEIGHT - 220.0),
-                CGSize::new(160.0, 26.0),
+                CGPoint::new(812.0, session_workspace_height - 44.0),
+                CGSize::new(186.0, 26.0),
             ),
             handler,
             sel!(setSummaryTemplate:),
@@ -615,18 +579,13 @@ impl MainWindow {
         for template in SummaryTemplate::all() {
             session_template_popup.addItemWithTitle(&NSString::from_str(template.label()));
         }
-        session_view.addSubview(&session_template_popup);
+        session_template_popup.setHidden(true);
+        session_workspace.addSubview(&session_template_popup);
 
-        let (session_structured_scroll, session_structured_text) = editor_scroll_view(
-            mtm,
-            CGRect::new(
-                CGPoint::new(CONTENT_PADDING + 618.0, 60.0),
-                CGSize::new(392.0, WINDOW_HEIGHT - 306.0),
-            ),
-            config.appearance,
-            false,
-        );
-        session_view.addSubview(&session_structured_scroll);
+        let (session_structured_scroll, session_structured_text) =
+            editor_scroll_view(mtm, activity_panel_frame, config.appearance, false);
+        session_structured_scroll.setHidden(true);
+        session_workspace.addSubview(&session_structured_scroll);
 
         // Reprocess button — shown for completed/failed sessions
         let session_reprocess_button = primary_button(
@@ -642,11 +601,8 @@ impl MainWindow {
         session_reprocess_button.setHidden(true);
         session_view.addSubview(&session_reprocess_button);
 
-        // Processing overlay — covers transcript + scratch pad areas during processing
-        let processing_overlay_frame = CGRect::new(
-            CGPoint::new(CONTENT_PADDING, 60.0),
-            CGSize::new(588.0, WINDOW_HEIGHT - 240.0),
-        );
+        // Processing overlay — covers the notes area during processing.
+        let processing_overlay_frame = notes_editor_frame;
         let session_processing_overlay = surface_view(
             mtm,
             processing_overlay_frame,
@@ -698,7 +654,7 @@ impl MainWindow {
         processing_hint.setAlignment(NSTextAlignment::Center);
         session_processing_overlay.addSubview(&processing_hint);
 
-        session_view.addSubview(&session_processing_overlay);
+        session_workspace.addSubview(&session_processing_overlay);
 
         let settings_view = NSView::new(mtm);
         settings_view.setFrame(content_bounds());
@@ -958,7 +914,10 @@ impl MainWindow {
             home_view,
             home_banner,
             home_dictation_hint,
+            home_backend_hint,
+            home_composer_hint,
             home_primary_button,
+            home_quick_note_button,
             home_recent_container,
             session_view,
             session_title,
@@ -969,6 +928,7 @@ impl MainWindow {
             session_stop_button,
             scratch_pad_scroll,
             scratch_pad_text,
+            session_activity_heading,
             transcript_scroll,
             transcript_container,
             session_template_popup,
@@ -1192,30 +1152,49 @@ impl MainWindow {
         if let Some(active) = active {
             self.home_banner
                 .setStringValue(&NSString::from_str(&format!(
-                    "Session live now · {} · {}",
+                    "Session live now. {} elapsed with {}.",
                     format_elapsed(active.elapsed_ms),
                     active.summary_backend_label
                 )));
             self.home_primary_button
                 .setTitle(&NSString::from_str("Open live"));
-        } else if self.ambient_controller.system_audio_runtime_supported() {
-            self.home_banner.setStringValue(&NSString::from_str(
-                "A fast local workspace for meetings, voice memos, and quick capture.",
+            self.home_quick_note_button
+                .setTitle(&NSString::from_str("Open live"));
+            self.home_composer_hint.setStringValue(&NSString::from_str(
+                "Open the live workspace and keep capturing.",
             ));
-            self.home_primary_button
-                .setTitle(&NSString::from_str("Start session"));
         } else {
             self.home_banner.setStringValue(&NSString::from_str(
-                self.ambient_controller.system_audio_runtime_reason(),
+                "No live session right now. Start a fresh ambient capture when you are ready.",
             ));
             self.home_primary_button
                 .setTitle(&NSString::from_str("Start session"));
+            self.home_quick_note_button
+                .setTitle(&NSString::from_str("Quick note"));
+            self.home_composer_hint.setStringValue(&NSString::from_str(
+                "Start a fresh ambient capture from home.",
+            ));
         }
 
-        self.home_dictation_hint
-            .setStringValue(&NSString::from_str(&format!(
+        let capture_line = if self.ambient_controller.system_audio_runtime_supported() {
+            format!(
                 "Hold {} to speak anywhere on your Mac.",
                 config.hotkey_label()
+            )
+        } else {
+            format!(
+                "Hold {} to dictate anywhere. {}",
+                config.hotkey_label(),
+                self.ambient_controller.system_audio_runtime_reason()
+            )
+        };
+        self.home_dictation_hint
+            .setStringValue(&NSString::from_str(&capture_line));
+        self.home_backend_hint
+            .setStringValue(&NSString::from_str(&format!(
+                "Summaries use {}. Final pass uses {}.",
+                config.summary_backend_label(),
+                config.ambient_final_backend_label()
             )));
     }
 
@@ -1263,7 +1242,8 @@ impl MainWindow {
                 appearance,
             );
             self.last_rendered_segment_count.set(session.segments.len());
-            self.last_rendered_segment_signature.replace(segment_signature);
+            self.last_rendered_segment_signature
+                .replace(segment_signature);
             self.last_persisted_notes
                 .replace(session.live_notes.clone());
         }
@@ -1323,7 +1303,18 @@ impl MainWindow {
         self.session_reprocess_button.setHidden(!is_finished);
         self.session_reprocess_button.setEnabled(is_finished);
 
-        // Processing overlay covers transcript + scratch pad area
+        // Notes stay primary; the right rail switches from transcript to summary when finished.
+        self.transcript_scroll.setHidden(is_finished);
+        self.session_structured_scroll.setHidden(!is_finished);
+        self.session_template_popup.setHidden(!is_finished);
+        self.session_activity_heading
+            .setStringValue(&NSString::from_str(if is_finished {
+                "Summary"
+            } else {
+                "Live transcript"
+            }));
+
+        // Processing overlay covers the notes area
         self.session_processing_overlay.setHidden(!is_processing);
 
         // Animate the processing label text with a rotating indicator
@@ -1360,7 +1351,7 @@ impl MainWindow {
             .unwrap_or(0);
         self.session_template_popup
             .selectItemAtIndex(template_index as isize);
-        self.session_template_popup.setEnabled(is_recording);
+        self.session_template_popup.setEnabled(!is_processing);
     }
 
     fn persist_editor_if_needed(&self) {
@@ -1445,7 +1436,12 @@ impl MainWindow {
             &theme::card_border(appearance),
             0.0,
         );
-        for view in [&self.home_primary_button, &self.session_stop_button] {
+        for view in [
+            &self.home_primary_button,
+            &self.home_quick_note_button,
+            &self.session_stop_button,
+            &self.session_reprocess_button,
+        ] {
             unsafe {
                 let _: () =
                     msg_send![&**view, setContentTintColor: &*theme::title_text(appearance)];
@@ -1458,6 +1454,13 @@ impl MainWindow {
 enum SessionButtonKind {
     Sidebar,
     Home,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HomeSessionSection {
+    Today,
+    Yesterday,
+    Earlier,
 }
 
 fn rebuild_session_button_list(
@@ -1530,84 +1533,70 @@ fn rebuild_session_button_list(
         return;
     }
 
-    for (index, session) in sessions.iter().enumerate() {
-        ids.push(session.id);
-        let frame = match kind {
-            SessionButtonKind::Sidebar => CGRect::new(
-                CGPoint::new(
-                    0.0,
-                    container.frame().size.height - 58.0 - index as f64 * 62.0,
-                ),
-                CGSize::new(container.frame().size.width, 50.0),
-            ),
-            SessionButtonKind::Home => CGRect::new(
-                CGPoint::new(
-                    0.0,
-                    container.frame().size.height - 86.0 - index as f64 * 92.0,
-                ),
-                CGSize::new(container.frame().size.width, 78.0),
-            ),
-        };
-        let mtm = MainThreadMarker::new().expect("button rebuild should be on main thread");
-        let card = surface_view(
-            mtm,
-            frame,
-            &theme::surface_background(appearance),
-            &theme::card_border(appearance),
-            match kind {
-                SessionButtonKind::Sidebar => 16.0,
-                SessionButtonKind::Home => 20.0,
-            },
-        );
-        container.addSubview(&card);
+    match kind {
+        SessionButtonKind::Sidebar => {
+            for (index, session) in sessions.iter().enumerate() {
+                ids.push(session.id);
+                let frame = CGRect::new(
+                    CGPoint::new(
+                        0.0,
+                        container.frame().size.height - 58.0 - index as f64 * 62.0,
+                    ),
+                    CGSize::new(container.frame().size.width, 50.0),
+                );
+                let mtm = MainThreadMarker::new().expect("button rebuild should be on main thread");
+                let card = surface_view(
+                    mtm,
+                    frame,
+                    &theme::surface_background(appearance),
+                    &theme::card_border(appearance),
+                    16.0,
+                );
+                container.addSubview(&card);
 
-        let accent_color = match session.state {
-            screamer_core::ambient::AmbientSessionState::Recording => theme::brand_gold(),
-            screamer_core::ambient::AmbientSessionState::Processing => theme::processing_accent(),
-            screamer_core::ambient::AmbientSessionState::Completed => {
-                theme::completed_accent(appearance)
-            }
-            screamer_core::ambient::AmbientSessionState::Failed => theme::failed_accent(),
-            _ => theme::brand_gold(),
-        };
-        let accent = surface_view(
-            mtm,
-            CGRect::new(
-                CGPoint::new(14.0, frame.size.height - 20.0),
-                CGSize::new(8.0, 8.0),
-            ),
-            &accent_color,
-            &accent_color,
-            4.0,
-        );
-        card.addSubview(&accent);
+                let accent_color = match session.state {
+                    screamer_core::ambient::AmbientSessionState::Recording => theme::brand_gold(),
+                    screamer_core::ambient::AmbientSessionState::Processing => {
+                        theme::processing_accent()
+                    }
+                    screamer_core::ambient::AmbientSessionState::Completed => {
+                        theme::completed_accent(appearance)
+                    }
+                    screamer_core::ambient::AmbientSessionState::Failed => theme::failed_accent(),
+                    _ => theme::brand_gold(),
+                };
+                let accent = surface_view(
+                    mtm,
+                    CGRect::new(
+                        CGPoint::new(14.0, frame.size.height - 20.0),
+                        CGSize::new(8.0, 8.0),
+                    ),
+                    &accent_color,
+                    &accent_color,
+                    4.0,
+                );
+                card.addSubview(&accent);
 
-        let button = unsafe {
-            let selector = match kind {
-                SessionButtonKind::Sidebar => sel!(openSessionFromSidebar:),
-                SessionButtonKind::Home => sel!(openSessionFromHome:),
-            };
-            NSButton::buttonWithTitle_target_action(
-                &NSString::from_str(""),
-                Some(&*handler),
-                Some(selector),
-                mtm,
-            )
-        };
-        button.setFrame(frame);
-        button.setTag(index as isize);
-        button.setButtonType(NSButtonType::MomentaryPushIn);
-        button.setBezelStyle(objc2_app_kit::NSBezelStyle::ShadowlessSquare);
-        button.setBordered(false);
-        button.setTitle(&NSString::from_str(""));
-        let tooltip = NSString::from_str(&session.title);
-        unsafe {
-            let _: () = msg_send![&*button, setToolTip: Some(&*tooltip)];
-        }
-        container.addSubview(&button);
+                let button = unsafe {
+                    NSButton::buttonWithTitle_target_action(
+                        &NSString::from_str(""),
+                        Some(&*handler),
+                        Some(sel!(openSessionFromSidebar:)),
+                        mtm,
+                    )
+                };
+                button.setFrame(frame);
+                button.setTag(index as isize);
+                button.setButtonType(NSButtonType::MomentaryPushIn);
+                button.setBezelStyle(objc2_app_kit::NSBezelStyle::ShadowlessSquare);
+                button.setBordered(false);
+                button.setTitle(&NSString::from_str(""));
+                let tooltip = NSString::from_str(&session.title);
+                unsafe {
+                    let _: () = msg_send![&*button, setToolTip: Some(&*tooltip)];
+                }
+                container.addSubview(&button);
 
-        match kind {
-            SessionButtonKind::Sidebar => {
                 let title = text_label(
                     mtm,
                     &compact_sidebar_text(&display_session_title(&session.title), 28),
@@ -1633,43 +1622,150 @@ fn rebuild_session_button_list(
                 card.addSubview(&title);
                 card.addSubview(&subtitle);
             }
-            SessionButtonKind::Home => {
-                let title = text_label(
+        }
+        SessionButtonKind::Home => {
+            ids.extend(sessions.iter().map(|session| session.id));
+
+            let sections = [
+                HomeSessionSection::Today,
+                HomeSessionSection::Yesterday,
+                HomeSessionSection::Earlier,
+            ];
+            let mut cursor = container.frame().size.height - 18.0;
+            for section in sections {
+                let entries = sessions
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, session)| home_session_section(session.updated_at_ms) == section)
+                    .collect::<Vec<_>>();
+                if entries.is_empty() {
+                    continue;
+                }
+
+                let mtm =
+                    MainThreadMarker::new().expect("home heading rebuild should be on main thread");
+                let heading = text_label(
                     mtm,
-                    &display_session_title(&session.title),
+                    home_section_title(section),
                     CGRect::new(
-                        CGPoint::new(20.0, 48.0),
-                        CGSize::new(frame.size.width - 40.0, 18.0),
-                    ),
-                    16.0,
-                    &theme::title_text(appearance),
-                    true,
-                );
-                let preview = text_label(
-                    mtm,
-                    &session_preview_line(session),
-                    CGRect::new(
-                        CGPoint::new(20.0, 28.0),
-                        CGSize::new(frame.size.width - 40.0, 16.0),
-                    ),
-                    12.5,
-                    &theme::secondary_text(appearance),
-                    false,
-                );
-                let meta = text_label(
-                    mtm,
-                    &session_meta_line(session),
-                    CGRect::new(
-                        CGPoint::new(20.0, 10.0),
-                        CGSize::new(frame.size.width - 40.0, 14.0),
+                        CGPoint::new(0.0, cursor),
+                        CGSize::new(container.frame().size.width, 16.0),
                     ),
                     11.5,
                     &theme::secondary_text(appearance),
-                    false,
+                    true,
                 );
-                card.addSubview(&title);
-                card.addSubview(&preview);
-                card.addSubview(&meta);
+                container.addSubview(&heading);
+                cursor -= 60.0;
+
+                for (index, session) in entries {
+                    let frame = CGRect::new(
+                        CGPoint::new(0.0, cursor),
+                        CGSize::new(container.frame().size.width, 52.0),
+                    );
+                    let mtm = MainThreadMarker::new()
+                        .expect("home activity rebuild should be on main thread");
+                    let row = surface_view(
+                        mtm,
+                        frame,
+                        &theme::surface_background(appearance),
+                        &theme::card_border(appearance),
+                        18.0,
+                    );
+                    container.addSubview(&row);
+
+                    let accent_color = match session.state {
+                        screamer_core::ambient::AmbientSessionState::Recording => {
+                            theme::brand_gold()
+                        }
+                        screamer_core::ambient::AmbientSessionState::Processing => {
+                            theme::processing_accent()
+                        }
+                        screamer_core::ambient::AmbientSessionState::Completed => {
+                            theme::completed_accent(appearance)
+                        }
+                        screamer_core::ambient::AmbientSessionState::Failed => {
+                            theme::failed_accent()
+                        }
+                        _ => theme::brand_gold(),
+                    };
+                    let badge = surface_view(
+                        mtm,
+                        CGRect::new(CGPoint::new(14.0, 15.0), CGSize::new(22.0, 22.0)),
+                        &theme::window_background(appearance),
+                        &theme::card_border(appearance),
+                        11.0,
+                    );
+                    row.addSubview(&badge);
+                    let badge_dot = surface_view(
+                        mtm,
+                        CGRect::new(CGPoint::new(7.0, 7.0), CGSize::new(8.0, 8.0)),
+                        &accent_color,
+                        &accent_color,
+                        4.0,
+                    );
+                    badge.addSubview(&badge_dot);
+
+                    let button = unsafe {
+                        NSButton::buttonWithTitle_target_action(
+                            &NSString::from_str(""),
+                            Some(&*handler),
+                            Some(sel!(openSessionFromHome:)),
+                            mtm,
+                        )
+                    };
+                    button.setFrame(frame);
+                    button.setTag(index as isize);
+                    button.setButtonType(NSButtonType::MomentaryPushIn);
+                    button.setBezelStyle(objc2_app_kit::NSBezelStyle::ShadowlessSquare);
+                    button.setBordered(false);
+                    button.setTitle(&NSString::from_str(""));
+                    let tooltip = NSString::from_str(&session.title);
+                    unsafe {
+                        let _: () = msg_send![&*button, setToolTip: Some(&*tooltip)];
+                    }
+                    container.addSubview(&button);
+
+                    let title = text_label(
+                        mtm,
+                        &display_session_title(&session.title),
+                        CGRect::new(
+                            CGPoint::new(48.0, 28.0),
+                            CGSize::new(frame.size.width - 160.0, 16.0),
+                        ),
+                        14.0,
+                        &theme::title_text(appearance),
+                        true,
+                    );
+                    let subtitle = text_label(
+                        mtm,
+                        &home_session_subtitle(session),
+                        CGRect::new(
+                            CGPoint::new(48.0, 12.0),
+                            CGSize::new(frame.size.width - 160.0, 14.0),
+                        ),
+                        11.5,
+                        &theme::secondary_text(appearance),
+                        false,
+                    );
+                    let time = text_label(
+                        mtm,
+                        &format_clock_time(session.updated_at_ms),
+                        CGRect::new(
+                            CGPoint::new(frame.size.width - 112.0, 18.0),
+                            CGSize::new(88.0, 16.0),
+                        ),
+                        11.5,
+                        &theme::secondary_text(appearance),
+                        false,
+                    );
+                    time.setAlignment(NSTextAlignment::Right);
+                    row.addSubview(&title);
+                    row.addSubview(&subtitle);
+                    row.addSubview(&time);
+
+                    cursor -= 60.0;
+                }
             }
         }
     }
@@ -2058,6 +2154,15 @@ fn session_preview_line(session: &SessionSummary) -> String {
     }
 }
 
+fn home_session_subtitle(session: &SessionSummary) -> String {
+    let preview = session_preview_line(session);
+    if preview == "No notes yet" {
+        session_meta_line(session)
+    } else {
+        preview
+    }
+}
+
 fn session_meta_line(session: &SessionSummary) -> String {
     match session.state {
         screamer_core::ambient::AmbientSessionState::Processing => {
@@ -2068,6 +2173,28 @@ fn session_meta_line(session: &SessionSummary) -> String {
             status_label(session.state),
             format_relative_time(session.updated_at_ms)
         ),
+    }
+}
+
+fn home_session_section(timestamp_ms: i64) -> HomeSessionSection {
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or(timestamp_ms);
+    let delta_seconds = ((now_ms - timestamp_ms).max(0) / 1_000) as u64;
+
+    match delta_seconds {
+        0..=86_399 => HomeSessionSection::Today,
+        86_400..=172_799 => HomeSessionSection::Yesterday,
+        _ => HomeSessionSection::Earlier,
+    }
+}
+
+fn home_section_title(section: HomeSessionSection) -> &'static str {
+    match section {
+        HomeSessionSection::Today => "Today",
+        HomeSessionSection::Yesterday => "Yesterday",
+        HomeSessionSection::Earlier => "Earlier",
     }
 }
 
@@ -2084,6 +2211,35 @@ fn format_relative_time(timestamp_ms: i64) -> String {
         3_600..=86_399 => format!("{}h ago", delta_seconds / 3_600),
         _ => format!("{}d ago", delta_seconds / 86_400),
     }
+}
+
+fn format_clock_time(timestamp_ms: i64) -> String {
+    let raw_seconds = (timestamp_ms / 1_000) as time_t;
+    let mut local_tm = unsafe { std::mem::zeroed::<libc::tm>() };
+    let format = b"%-I:%M %p\0";
+    let mut buffer = [0i8; 32];
+
+    let result = unsafe { localtime_r(&raw_seconds, &mut local_tm) };
+    if result.is_null() {
+        return format_relative_time(timestamp_ms);
+    }
+
+    let written = unsafe {
+        strftime(
+            buffer.as_mut_ptr(),
+            buffer.len(),
+            format.as_ptr() as *const libc::c_char,
+            &local_tm,
+        )
+    };
+    if written == 0 {
+        return format_relative_time(timestamp_ms);
+    }
+
+    unsafe { CStr::from_ptr(buffer.as_ptr()) }
+        .to_string_lossy()
+        .trim()
+        .to_string()
 }
 
 fn format_elapsed(elapsed_ms: u64) -> String {

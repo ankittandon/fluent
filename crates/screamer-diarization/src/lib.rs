@@ -1,9 +1,8 @@
 mod assets;
 
 pub use assets::{
-    path_file_name, write_manifest, AmbientDiarizationAssetFile,
-    AmbientDiarizationAssetManifest, AmbientDiarizationAssetSet,
-    AmbientDiarizationModelSpec, AmbientDiarizationPipelineManifest,
+    path_file_name, write_manifest, AmbientDiarizationAssetFile, AmbientDiarizationAssetManifest,
+    AmbientDiarizationAssetSet, AmbientDiarizationModelSpec, AmbientDiarizationPipelineManifest,
     AmbientModelInputLayout, AmbientModelOutputLayout, AMBIENT_DIARIZATION_DIR_ENV,
     ASSET_MANIFEST_NAME, BUILTIN_ASSET_VERSION,
 };
@@ -120,13 +119,7 @@ impl RegionEmbedding {
         if values.is_empty() {
             return None;
         }
-        Some(
-            Self {
-                values,
-                mfcc: None,
-            }
-            .normalized(),
-        )
+        Some(Self { values, mfcc: None }.normalized())
     }
 
     fn normalized(mut self) -> Self {
@@ -344,15 +337,19 @@ fn build_candidate_regions(transcript_segments: &[TranscriptSegment]) -> Vec<Can
 fn smooth_regions(regions: &mut Vec<CandidateRegion>) {
     let mut index = 0usize;
     while index < regions.len() {
-        let duration_ms = regions[index].end_ms.saturating_sub(regions[index].start_ms);
+        let duration_ms = regions[index]
+            .end_ms
+            .saturating_sub(regions[index].start_ms);
         if duration_ms >= SHORT_REGION_MS || regions.len() <= 1 {
             index += 1;
             continue;
         }
 
-        let prev_gap = index
-            .checked_sub(1)
-            .and_then(|prev| regions.get(prev).map(|region| regions[index].start_ms.saturating_sub(region.end_ms)));
+        let prev_gap = index.checked_sub(1).and_then(|prev| {
+            regions
+                .get(prev)
+                .map(|region| regions[index].start_ms.saturating_sub(region.end_ms))
+        });
         let next_gap = regions
             .get(index + 1)
             .map(|next| next.start_ms.saturating_sub(regions[index].end_ms));
@@ -385,7 +382,9 @@ fn merge_region_into_previous(regions: &mut Vec<CandidateRegion>, prev: usize, c
     let current_region = regions.remove(current);
     if let Some(previous) = regions.get_mut(prev) {
         previous.end_ms = previous.end_ms.max(current_region.end_ms);
-        previous.segment_indices.extend(current_region.segment_indices);
+        previous
+            .segment_indices
+            .extend(current_region.segment_indices);
     }
 }
 
@@ -430,7 +429,9 @@ fn assign_clusters(regions: &mut [CandidateRegion], similarity_threshold: f32) {
 
         for left in 0..clusters.len() {
             for right in (left + 1)..clusters.len() {
-                let similarity = clusters[left].centroid.cosine_similarity(&clusters[right].centroid);
+                let similarity = clusters[left]
+                    .centroid
+                    .cosine_similarity(&clusters[right].centroid);
                 if similarity > best_similarity {
                     best_similarity = similarity;
                     best_pair = Some((left, right));
@@ -442,7 +443,9 @@ fn assign_clusters(regions: &mut [CandidateRegion], similarity_threshold: f32) {
             break;
         };
         let right_cluster = clusters.remove(right);
-        clusters[left].region_indices.extend(right_cluster.region_indices);
+        clusters[left]
+            .region_indices
+            .extend(right_cluster.region_indices);
         clusters[left].centroid = average_centroid(&clusters[left], regions);
     }
 
@@ -573,10 +576,17 @@ fn assign_segment_labels(
             .iter()
             .filter_map(|region| {
                 let cluster_id = region.cluster_id?;
-                let overlap = overlap_ms(segment.start_ms, segment.end_ms, region.start_ms, region.end_ms);
+                let overlap = overlap_ms(
+                    segment.start_ms,
+                    segment.end_ms,
+                    region.start_ms,
+                    region.end_ms,
+                );
                 Some((region, cluster_id, overlap))
             })
-            .max_by_key(|(region, _cluster_id, overlap)| (*overlap, std::cmp::Reverse(region.start_ms)));
+            .max_by_key(|(region, _cluster_id, overlap)| {
+                (*overlap, std::cmp::Reverse(region.start_ms))
+            });
 
         if let Some((_region, cluster_id, overlap)) = best_region {
             if overlap > 0 {
@@ -679,7 +689,10 @@ fn speaker_label_for_index(index: usize) -> SpeakerLabel {
 }
 
 fn unique_speaker_count(segments: &[CanonicalSegment]) -> usize {
-    let mut speakers = segments.iter().map(|segment| segment.speaker).collect::<Vec<_>>();
+    let mut speakers = segments
+        .iter()
+        .map(|segment| segment.speaker)
+        .collect::<Vec<_>>();
     speakers.sort_by_key(|speaker| speaker.index());
     speakers.dedup();
     speakers.len()
@@ -709,26 +722,32 @@ fn snap_regions_to_speech(regions: &mut [CandidateRegion], speech_regions: &[Spe
         if let Some(best_overlap_region) = speech_regions
             .iter()
             .filter_map(|speech| {
-                let overlap = overlap_ms(region.start_ms, region.end_ms, speech.start_ms, speech.end_ms);
+                let overlap = overlap_ms(
+                    region.start_ms,
+                    region.end_ms,
+                    speech.start_ms,
+                    speech.end_ms,
+                );
                 (overlap > 0).then_some((overlap, speech))
             })
             .max_by_key(|(overlap, speech)| (*overlap, std::cmp::Reverse(speech.start_ms)))
             .map(|(_, speech)| speech)
         {
-            region.start_ms = region
-                .start_ms
-                .max(best_overlap_region.start_ms.saturating_sub(DEFAULT_SPEECH_SNAP_COLLAR_MS));
-            region.end_ms = region
-                .end_ms
-                .min(best_overlap_region.end_ms.saturating_add(DEFAULT_SPEECH_SNAP_COLLAR_MS));
-        } else if let Some(nearest_speech) = speech_regions
-            .iter()
-            .min_by_key(|speech| {
-                let midpoint = (region.start_ms + region.end_ms) / 2;
-                let speech_midpoint = (speech.start_ms + speech.end_ms) / 2;
-                midpoint.abs_diff(speech_midpoint)
-            })
-        {
+            region.start_ms = region.start_ms.max(
+                best_overlap_region
+                    .start_ms
+                    .saturating_sub(DEFAULT_SPEECH_SNAP_COLLAR_MS),
+            );
+            region.end_ms = region.end_ms.min(
+                best_overlap_region
+                    .end_ms
+                    .saturating_add(DEFAULT_SPEECH_SNAP_COLLAR_MS),
+            );
+        } else if let Some(nearest_speech) = speech_regions.iter().min_by_key(|speech| {
+            let midpoint = (region.start_ms + region.end_ms) / 2;
+            let speech_midpoint = (speech.start_ms + speech.end_ms) / 2;
+            midpoint.abs_diff(speech_midpoint)
+        }) {
             let midpoint = (region.start_ms + region.end_ms) / 2;
             let speech_midpoint = (nearest_speech.start_ms + nearest_speech.end_ms) / 2;
             if midpoint.abs_diff(speech_midpoint) <= DEFAULT_NEAREST_SPEECH_ATTACH_MS {
@@ -755,7 +774,10 @@ fn build_speech_regions_from_scores(
         return Vec::new();
     }
 
-    let mut active = scores.iter().map(|score| *score >= threshold).collect::<Vec<_>>();
+    let mut active = scores
+        .iter()
+        .map(|score| *score >= threshold)
+        .collect::<Vec<_>>();
     fill_short_silence_gaps(
         &mut active,
         ((min_silence_ms + frame_hop_ms.saturating_sub(1)) / frame_hop_ms) as usize,
@@ -880,7 +902,8 @@ fn build_model_regions(
         fallback_cache_name: &str,
     ) -> Result<Session, String> {
         let model_path = asset_set.resolve_relative_path(&model.relative_path);
-        let cache_dir = asset_set.model_cache_dir(model.model_cache_subdir.as_deref(), fallback_cache_name);
+        let cache_dir =
+            asset_set.model_cache_dir(model.model_cache_subdir.as_deref(), fallback_cache_name);
         std::fs::create_dir_all(&cache_dir).map_err(|err| {
             format!(
                 "Failed to create ambient diarization CoreML cache directory {}: {err}",
@@ -899,9 +922,12 @@ fn build_model_regions(
         builder = builder
             .with_execution_providers([execution_provider])
             .map_err(|err| format!("Failed to configure CoreML execution provider: {err}"))?;
-        builder
-            .commit_from_file(&model_path)
-            .map_err(|err| format!("Failed to load ambient diarization model {}: {err}", model_path.display()))
+        builder.commit_from_file(&model_path).map_err(|err| {
+            format!(
+                "Failed to load ambient diarization model {}: {err}",
+                model_path.display()
+            )
+        })
     }
 
     fn prepare_window_samples(
@@ -952,16 +978,14 @@ fn build_model_regions(
         samples: Vec<f32>,
     ) -> Result<Tensor<f32>, String> {
         match model.input_layout {
-            AmbientModelInputLayout::BatchSamples => Tensor::from_array((
-                [1usize, samples.len()],
-                samples.into_boxed_slice(),
-            ))
-            .map_err(|err| format!("Failed to build ONNX input tensor: {err}")),
-            AmbientModelInputLayout::BatchChannelSamples => Tensor::from_array((
-                [1usize, 1usize, samples.len()],
-                samples.into_boxed_slice(),
-            ))
-            .map_err(|err| format!("Failed to build ONNX input tensor: {err}")),
+            AmbientModelInputLayout::BatchSamples => {
+                Tensor::from_array(([1usize, samples.len()], samples.into_boxed_slice()))
+                    .map_err(|err| format!("Failed to build ONNX input tensor: {err}"))
+            }
+            AmbientModelInputLayout::BatchChannelSamples => {
+                Tensor::from_array(([1usize, 1usize, samples.len()], samples.into_boxed_slice()))
+                    .map_err(|err| format!("Failed to build ONNX input tensor: {err}"))
+            }
         }
     }
 
@@ -983,7 +1007,9 @@ fn build_model_regions(
         let output = if let Some(name) = model.output_name.as_deref() {
             outputs
                 .get(name)
-                .ok_or_else(|| format!("Model output `{name}` was not present in ONNX Runtime outputs."))?
+                .ok_or_else(|| {
+                    format!("Model output `{name}` was not present in ONNX Runtime outputs.")
+                })?
                 .view()
         } else {
             outputs
@@ -1045,7 +1071,9 @@ fn build_model_regions(
                 }
                 Ok((frames, speakers, reordered))
             }
-            _ => Err("Segmentation model output layout must be a speaker-activity tensor.".to_string()),
+            _ => Err(
+                "Segmentation model output layout must be a speaker-activity tensor.".to_string(),
+            ),
         }
     }
 
@@ -1061,12 +1089,16 @@ fn build_model_regions(
             ));
         }
 
-        let audio_duration_ms =
-            ((request.samples.len() as u128 * 1_000) / request.sample_rate_hz.max(1) as u128) as u64;
-        let window_starts = sliding_window_starts(audio_duration_ms, segmentation.window_ms, segmentation.hop_ms);
+        let audio_duration_ms = ((request.samples.len() as u128 * 1_000)
+            / request.sample_rate_hz.max(1) as u128) as u64;
+        let window_starts = sliding_window_starts(
+            audio_duration_ms,
+            segmentation.window_ms,
+            segmentation.hop_ms,
+        );
         let global_frame_hop_ms = segmentation.frame_hop_ms.max(1);
-        let global_frame_count = ((audio_duration_ms + global_frame_hop_ms - 1) / global_frame_hop_ms)
-            .max(1) as usize;
+        let global_frame_count =
+            ((audio_duration_ms + global_frame_hop_ms - 1) / global_frame_hop_ms).max(1) as usize;
         let mut score_sum = vec![0.0f32; global_frame_count];
         let mut score_count = vec![0u32; global_frame_count];
 
@@ -1094,7 +1126,8 @@ fn build_model_regions(
                     .copied()
                     .fold(f32::MIN, f32::max)
                     .max(0.0);
-                let global_frame = ((start_ms / global_frame_hop_ms) as usize).saturating_add(frame_index);
+                let global_frame =
+                    ((start_ms / global_frame_hop_ms) as usize).saturating_add(frame_index);
                 if global_frame >= global_frame_count {
                     break;
                 }
@@ -1106,13 +1139,15 @@ fn build_model_regions(
         let averaged_scores = score_sum
             .into_iter()
             .zip(score_count.into_iter())
-            .map(|(sum, count)| {
-                if count == 0 {
-                    0.0
-                } else {
-                    sum / count as f32
-                }
-            })
+            .map(
+                |(sum, count)| {
+                    if count == 0 {
+                        0.0
+                    } else {
+                        sum / count as f32
+                    }
+                },
+            )
             .collect::<Vec<_>>();
 
         Ok(build_speech_regions_from_scores(
@@ -1328,7 +1363,13 @@ mod tests {
 
         snap_regions_to_speech(&mut regions, &speech);
 
-        assert_eq!(regions[0].start_ms, 100.max(150 - DEFAULT_SPEECH_SNAP_COLLAR_MS));
-        assert_eq!(regions[0].end_ms, 420.min(350 + DEFAULT_SPEECH_SNAP_COLLAR_MS));
+        assert_eq!(
+            regions[0].start_ms,
+            100.max(150 - DEFAULT_SPEECH_SNAP_COLLAR_MS)
+        );
+        assert_eq!(
+            regions[0].end_ms,
+            420.min(350 + DEFAULT_SPEECH_SNAP_COLLAR_MS)
+        );
     }
 }

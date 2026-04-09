@@ -106,8 +106,12 @@ pub fn write_temp_wav(prefix: &str, samples: &[f32]) -> Result<PathBuf, String> 
         bits_per_sample: 16,
         sample_format: hound::SampleFormat::Int,
     };
-    let mut writer = hound::WavWriter::create(&path, spec)
-        .map_err(|err| format!("Failed to create temporary WAV at {}: {err}", path.display()))?;
+    let mut writer = hound::WavWriter::create(&path, spec).map_err(|err| {
+        format!(
+            "Failed to create temporary WAV at {}: {err}",
+            path.display()
+        )
+    })?;
 
     for sample in samples {
         let scaled = (sample.clamp(-1.0, 1.0) * i16::MAX as f32).round() as i16;
@@ -116,9 +120,12 @@ pub fn write_temp_wav(prefix: &str, samples: &[f32]) -> Result<PathBuf, String> 
             .map_err(|err| format!("Failed to write temporary WAV at {}: {err}", path.display()))?;
     }
 
-    writer
-        .finalize()
-        .map_err(|err| format!("Failed to finalize temporary WAV at {}: {err}", path.display()))?;
+    writer.finalize().map_err(|err| {
+        format!(
+            "Failed to finalize temporary WAV at {}: {err}",
+            path.display()
+        )
+    })?;
     Ok(path)
 }
 
@@ -221,20 +228,26 @@ fn helper_script_path() -> Option<PathBuf> {
         if parent.ends_with("deps") {
             if let Some(build_dir) = parent.parent() {
                 candidates.push(build_dir.join(HELPER_SCRIPT_NAME));
-                if let Some(repo_root) = build_dir.parent().and_then(|target_dir| target_dir.parent())
+                if let Some(repo_root) = build_dir
+                    .parent()
+                    .and_then(|target_dir| target_dir.parent())
                 {
                     candidates.push(repo_root.join("scripts").join(HELPER_SCRIPT_NAME));
                 }
             }
-        } else if let Some(repo_root) = parent.parent().and_then(|target_dir| target_dir.parent())
-        {
+        } else if let Some(repo_root) = parent.parent().and_then(|target_dir| target_dir.parent()) {
             candidates.push(repo_root.join("scripts").join(HELPER_SCRIPT_NAME));
         }
 
         if parent.ends_with("MacOS") {
             if let Some(contents) = parent.parent() {
                 candidates.push(contents.join("Resources").join(HELPER_SCRIPT_NAME));
-                candidates.push(contents.join("Resources").join("scripts").join(HELPER_SCRIPT_NAME));
+                candidates.push(
+                    contents
+                        .join("Resources")
+                        .join("scripts")
+                        .join(HELPER_SCRIPT_NAME),
+                );
             }
         }
     }

@@ -194,7 +194,10 @@ pub fn speaker_other(appearance: AppAppearance) -> Retained<NSColor> {
     }
 }
 
-pub fn speaker_color_for_index(speaker_index: usize, appearance: AppAppearance) -> Retained<NSColor> {
+pub fn speaker_color_for_index(
+    speaker_index: usize,
+    appearance: AppAppearance,
+) -> Retained<NSColor> {
     match speaker_index {
         0 => speaker_you(appearance),
         1 => speaker_other(appearance),

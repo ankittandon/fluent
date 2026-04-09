@@ -167,14 +167,7 @@ fn generate_vision_response(
 
     // Evaluate all chunks (text + image embeddings)
     let n_past = chunks
-        .eval_chunks(
-            &mtmd_ctx,
-            &context,
-            0,
-            0,
-            DEFAULT_BATCH_TOKENS as i32,
-            true,
-        )
+        .eval_chunks(&mtmd_ctx, &context, 0, 0, DEFAULT_BATCH_TOKENS as i32, true)
         .map_err(|err| format!("Failed to evaluate multimodal chunks: {err}"))?;
 
     // Generate response tokens

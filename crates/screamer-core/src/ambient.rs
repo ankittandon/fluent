@@ -1,7 +1,10 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 
 pub const DEFAULT_CHUNK_SECONDS: u64 = 8;
 pub const DEFAULT_OVERLAP_SECONDS: u64 = 1;
+const TRANSCRIPT_REPEAT_NGRAM_MIN: usize = 3;
+const TRANSCRIPT_REPEAT_NGRAM_MAX: usize = 12;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -285,7 +288,203 @@ pub fn chunk_len_samples(chunk_seconds: u64, sample_rate: usize) -> usize {
     chunk_seconds as usize * sample_rate
 }
 
+fn repair_transcript_spacing(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        out.push(ch);
+        if matches!(ch, '.' | '?' | '!' | ';' | ':') {
+            if let Some(next) = chars.peek().copied() {
+                if !next.is_whitespace() && !matches!(next, '.' | ',' | '?' | '!') {
+                    out.push(' ');
+                }
+            }
+        }
+    }
+
+    out
+}
+
+fn collapse_spaces(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn split_transcript_fragments(text: &str) -> Vec<String> {
+    let mut fragments = Vec::<String>::new();
+    let mut current = String::new();
+
+    for ch in text.chars() {
+        current.push(ch);
+        if matches!(ch, '.' | '?' | '!' | ';' | '\n') {
+            let fragment = collapse_spaces(current.trim());
+            if !fragment.is_empty() {
+                fragments.push(fragment);
+            }
+            current.clear();
+        }
+    }
+
+    let trailing = collapse_spaces(current.trim());
+    if !trailing.is_empty() {
+        fragments.push(trailing);
+    }
+    if fragments.is_empty() {
+        let single = collapse_spaces(text.trim());
+        if !single.is_empty() {
+            fragments.push(single);
+        }
+    }
+
+    fragments
+}
+
+fn transcript_tokens(text: &str) -> Vec<String> {
+    text.split_whitespace()
+        .filter_map(|token| {
+            let normalized = token
+                .trim_matches(|ch: char| !ch.is_alphanumeric() && ch != '\'')
+                .to_ascii_lowercase();
+            (!normalized.is_empty()).then_some(normalized)
+        })
+        .collect()
+}
+
+fn compact_repeated_tokens(text: &str) -> String {
+    let raw_tokens = text.split_whitespace().collect::<Vec<_>>();
+    if raw_tokens.is_empty() {
+        return String::new();
+    }
+
+    let normalized_tokens = raw_tokens
+        .iter()
+        .map(|token| {
+            token
+                .trim_matches(|ch: char| !ch.is_alphanumeric() && ch != '\'')
+                .to_ascii_lowercase()
+        })
+        .collect::<Vec<_>>();
+    let mut kept = Vec::<&str>::new();
+    let mut kept_normalized = Vec::<String>::new();
+    let max_ngram = TRANSCRIPT_REPEAT_NGRAM_MAX.min(raw_tokens.len() / 2);
+    let mut index = 0usize;
+
+    while index < raw_tokens.len() {
+        let mut collapsed = false;
+        for size in (TRANSCRIPT_REPEAT_NGRAM_MIN..=max_ngram).rev() {
+            if index + size * 2 > raw_tokens.len() {
+                continue;
+            }
+            if normalized_tokens[index..index + size]
+                .iter()
+                .any(|token| token.is_empty())
+            {
+                continue;
+            }
+
+            let first = &normalized_tokens[index..index + size];
+            let second = &normalized_tokens[index + size..index + size * 2];
+            if first != second {
+                continue;
+            }
+
+            kept.extend_from_slice(&raw_tokens[index..index + size]);
+            kept_normalized.extend(first.iter().cloned());
+            let pattern = first.to_vec();
+            index += size * 2;
+            while index + size <= raw_tokens.len()
+                && normalized_tokens[index..index + size] == pattern[..]
+            {
+                index += size;
+            }
+            collapsed = true;
+            break;
+        }
+
+        if collapsed {
+            continue;
+        }
+
+        if kept_normalized
+            .last()
+            .is_some_and(|last| !last.is_empty() && *last == normalized_tokens[index])
+        {
+            index += 1;
+            continue;
+        }
+
+        kept.push(raw_tokens[index]);
+        kept_normalized.push(normalized_tokens[index].clone());
+        index += 1;
+    }
+
+    collapse_spaces(&kept.join(" "))
+}
+
+fn transcript_fragments_similar(left: &str, right: &str) -> bool {
+    let left_normalized = collapse_spaces(&left.to_ascii_lowercase());
+    let right_normalized = collapse_spaces(&right.to_ascii_lowercase());
+
+    if left_normalized == right_normalized {
+        return true;
+    }
+
+    if left_normalized.contains(&right_normalized) || right_normalized.contains(&left_normalized) {
+        return left_normalized.len().min(right_normalized.len()) >= 24;
+    }
+
+    let left_tokens = transcript_tokens(&left_normalized);
+    let right_tokens = transcript_tokens(&right_normalized);
+    if left_tokens.is_empty() || right_tokens.is_empty() {
+        return false;
+    }
+
+    let left_set = left_tokens.iter().collect::<HashSet<_>>();
+    let right_set = right_tokens.iter().collect::<HashSet<_>>();
+    let intersection = left_set.intersection(&right_set).count() as f32;
+    let union = left_set.union(&right_set).count() as f32;
+
+    union > 0.0 && intersection / union >= 0.8
+}
+
+fn clean_transcript_text(text: &str) -> String {
+    let repaired = repair_transcript_spacing(text);
+    let mut kept = Vec::<String>::new();
+
+    for fragment in split_transcript_fragments(&repaired) {
+        let compacted = compact_repeated_tokens(&fragment);
+        let compacted = collapse_spaces(compacted.trim());
+        if compacted.is_empty() {
+            continue;
+        }
+
+        if let Some(existing) = kept
+            .iter_mut()
+            .rev()
+            .take(3)
+            .find(|existing| transcript_fragments_similar(existing, &compacted))
+        {
+            if compacted.chars().count() > existing.chars().count()
+                && compacted.contains(existing.as_str())
+            {
+                *existing = compacted;
+            }
+            continue;
+        }
+
+        kept.push(compacted);
+    }
+
+    if kept.is_empty() {
+        collapse_spaces(&compact_repeated_tokens(&repaired))
+    } else {
+        kept.join(". ")
+    }
+}
+
 pub fn stitch_text(existing: &str, incoming: &str) -> String {
+    let existing = clean_transcript_text(existing);
+    let incoming = clean_transcript_text(incoming);
     let existing = existing.trim();
     let incoming = incoming.trim();
 
@@ -298,15 +497,39 @@ pub fn stitch_text(existing: &str, incoming: &str) -> String {
     if existing == incoming || existing.ends_with(incoming) {
         return String::new();
     }
+    if existing.contains(incoming) && incoming.chars().count() >= 24 {
+        return String::new();
+    }
 
     let existing_words: Vec<&str> = existing.split_whitespace().collect();
     let incoming_words: Vec<&str> = incoming.split_whitespace().collect();
-    let max_overlap = existing_words.len().min(incoming_words.len()).min(12);
+    let existing_tokens = existing_words
+        .iter()
+        .map(|word| {
+            word.trim_matches(|ch: char| !ch.is_alphanumeric() && ch != '\'')
+                .to_ascii_lowercase()
+        })
+        .collect::<Vec<_>>();
+    let incoming_tokens = incoming_words
+        .iter()
+        .map(|word| {
+            word.trim_matches(|ch: char| !ch.is_alphanumeric() && ch != '\'')
+                .to_ascii_lowercase()
+        })
+        .collect::<Vec<_>>();
+    let max_overlap = existing_words.len().min(incoming_words.len()).min(20);
 
     for overlap in (1..=max_overlap).rev() {
-        if existing_words[existing_words.len() - overlap..] == incoming_words[..overlap] {
-            return incoming_words[overlap..].join(" ").trim().to_string();
+        if existing_tokens[existing_tokens.len() - overlap..] == incoming_tokens[..overlap] {
+            return collapse_spaces(&incoming_words[overlap..].join(" "));
         }
+    }
+
+    if transcript_fragments_similar(existing, incoming)
+        && existing.chars().count().abs_diff(incoming.chars().count())
+            <= incoming.chars().count() / 4
+    {
+        return String::new();
     }
 
     incoming.to_string()
@@ -317,6 +540,7 @@ pub fn merge_segment(
     mut incoming: CanonicalSegment,
     force_new: bool,
 ) -> Option<CanonicalSegment> {
+    incoming.text = clean_transcript_text(&incoming.text);
     let stitched = segments
         .last()
         .map(|last| stitch_text(&last.text, &incoming.text))
@@ -340,14 +564,34 @@ pub fn merge_segment(
                     last.text.push(' ');
                 }
                 last.text.push_str(incoming.text.trim());
+                last.text = clean_transcript_text(&last.text);
                 last.end_ms = incoming.end_ms;
                 return Some(last.clone());
             }
         }
     }
 
+    incoming.text = clean_transcript_text(&incoming.text);
+    if incoming.text.trim().is_empty() {
+        return None;
+    }
     segments.push(incoming.clone());
     Some(incoming)
+}
+
+pub fn clean_canonical_segments(segments: &[CanonicalSegment]) -> Vec<CanonicalSegment> {
+    let mut cleaned = Vec::<CanonicalSegment>::with_capacity(segments.len());
+
+    for segment in segments {
+        let mut normalized = segment.clone();
+        normalized.text = clean_transcript_text(&normalized.text);
+        if normalized.text.trim().is_empty() {
+            continue;
+        }
+        let _ = merge_segment(&mut cleaned, normalized, false);
+    }
+
+    cleaned
 }
 
 pub fn segments_to_transcript(segments: &[CanonicalSegment]) -> String {
@@ -425,6 +669,15 @@ mod tests {
     }
 
     #[test]
+    fn stitch_compacts_repeated_phrases_and_repairs_spacing() {
+        let stitched = stitch_text(
+            "I'm on call but I'm taking the 20th PTO.I'm not going to be working and I probably won't even take my work computer with me.",
+            "I'm not going to be working and I probably won't even take my work computer with me. Can I swap an on call with someone?",
+        );
+        assert_eq!(stitched, "Can I swap an on call with someone?");
+    }
+
+    #[test]
     fn merge_segment_extends_matching_turn() {
         let mut segments = vec![CanonicalSegment {
             id: 1,
@@ -481,6 +734,43 @@ mod tests {
         assert_eq!(segments.len(), 2);
         assert_eq!(segments[0].text, "hello");
         assert_eq!(segments[1].text, "world");
+    }
+
+    #[test]
+    fn clean_canonical_segments_compacts_repetition_heavy_transcript() {
+        let cleaned = clean_canonical_segments(&[
+            CanonicalSegment {
+                id: 1,
+                lane: AudioLane::Microphone,
+                speaker: SpeakerLabel::S1,
+                start_ms: 0,
+                end_ms: 500,
+                text: "Not next week with the following week.I also have a favor to ask.Not next week with the following week.on call but I'm taking the 28th".to_string(),
+            },
+            CanonicalSegment {
+                id: 2,
+                lane: AudioLane::Microphone,
+                speaker: SpeakerLabel::S1,
+                start_ms: 500,
+                end_ms: 1_000,
+                text: "I'm on call, but I'm taking the 20th PTO. I'm on call, but I'm taking the 20th PTO. I'm not going to be working and I probably won't even take my work computer with me.".to_string(),
+            },
+        ]);
+
+        let transcript = segments_to_transcript(&cleaned);
+        assert!(transcript.contains("I also have a favor to ask."));
+        assert_eq!(
+            transcript
+                .matches("Not next week with the following week")
+                .count(),
+            1
+        );
+        assert_eq!(
+            transcript
+                .matches("I'm on call, but I'm taking the 20th PTO")
+                .count(),
+            1
+        );
     }
 
     #[test]

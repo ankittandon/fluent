@@ -5,8 +5,7 @@ use crate::recorder::Recorder;
 use crate::session_store::{SessionDetail, SessionStore};
 use crate::summary_backend::SummaryBackendRegistry;
 use screamer_core::ambient::{
-    AmbientSessionConfig, AmbientSessionState, CanonicalSegment, DiarizationEngine,
-    SummaryTemplate,
+    AmbientSessionConfig, AmbientSessionState, CanonicalSegment, DiarizationEngine, SummaryTemplate,
 };
 use screamer_whisper::Transcriber;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -279,24 +278,28 @@ impl AmbientController {
         let summary_registry = self.summary_registry.clone();
         let app_config = config.clone();
         std::thread::spawn(move || {
+            let cleaned_segments =
+                screamer_core::ambient::clean_canonical_segments(&detail.segments);
+            let live_notes = screamer_core::ambient::segments_to_transcript(&cleaned_segments);
+            if cleaned_segments != detail.segments {
+                let _ = store.replace_segments(session_id, &cleaned_segments);
+                let _ = store.update_live_notes(session_id, &live_notes);
+            }
             let summarizer = summary_registry.summarizer_for_config(&app_config);
-            let title_hint = summary_registry.concise_session_title(
-                &app_config,
-                &detail.live_notes,
-                &detail.segments,
-            );
+            let title_hint =
+                summary_registry.concise_session_title(&app_config, &live_notes, &cleaned_segments);
             let notes_with_scratch = if detail.scratch_pad.trim().is_empty() {
-                detail.live_notes.clone()
+                live_notes.clone()
             } else {
                 format!(
                     "--- User Notes (Scratch Pad) ---\n{}\n--- End User Notes ---\n\n{}",
-                    detail.scratch_pad, detail.live_notes
+                    detail.scratch_pad, live_notes
                 )
             };
             let structured_notes = summarizer
                 .summarize(
                     &notes_with_scratch,
-                    &detail.segments,
+                    &cleaned_segments,
                     Some(&title_hint),
                     detail.summary_template,
                 )
@@ -307,15 +310,14 @@ impl AmbientController {
                         title_hint, err
                     )
                 });
-            let transcript_markdown =
-                screamer_core::ambient::segments_to_transcript(&detail.segments);
+            let transcript_markdown = live_notes.clone();
 
             // Generate a better title from the completed summary
             let title = summary_registry.title_from_summary(
                 &app_config,
                 &structured_notes,
-                &detail.live_notes,
-                &detail.segments,
+                &live_notes,
+                &cleaned_segments,
             );
 
             let final_state = if structured_notes.is_empty() {
@@ -475,6 +477,19 @@ fn spawn_runtime_worker(
                         state.warning = warning.clone();
                     }
                 }
+            }
+        }
+
+        let cleaned_segments = screamer_core::ambient::clean_canonical_segments(&segments);
+        if cleaned_segments != segments {
+            segments = cleaned_segments;
+            live_notes = screamer_core::ambient::segments_to_transcript(&segments);
+            let _ = store.replace_segments(session_id, &segments);
+            let _ = store.update_live_notes(session_id, &live_notes);
+            if let Ok(mut state) = snapshot.lock() {
+                state.live_notes = live_notes.clone();
+                state.segments = segments.clone();
+                state.transcript_markdown = live_notes.clone();
             }
         }
 

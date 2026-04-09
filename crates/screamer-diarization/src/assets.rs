@@ -197,10 +197,14 @@ pub struct AmbientDiarizationAssetSet {
 impl AmbientDiarizationAssetManifest {
     pub fn validate(&self, root_dir: &Path) -> Result<(), String> {
         if self.format_version == 0 {
-            return Err("Ambient diarization asset manifest is missing `format_version`.".to_string());
+            return Err(
+                "Ambient diarization asset manifest is missing `format_version`.".to_string(),
+            );
         }
         if self.asset_version.trim().is_empty() {
-            return Err("Ambient diarization asset manifest is missing `asset_version`.".to_string());
+            return Err(
+                "Ambient diarization asset manifest is missing `asset_version`.".to_string(),
+            );
         }
 
         for file in &self.files {
@@ -279,8 +283,12 @@ pub fn write_manifest(
     let path = target_dir.join(ASSET_MANIFEST_NAME);
     let bytes = serde_json::to_vec_pretty(manifest)
         .map_err(|err| format!("Failed to serialize ambient diarization asset manifest: {err}"))?;
-    fs::write(&path, bytes)
-        .map_err(|err| format!("Failed to write ambient diarization manifest {}: {err}", path.display()))?;
+    fs::write(&path, bytes).map_err(|err| {
+        format!(
+            "Failed to write ambient diarization manifest {}: {err}",
+            path.display()
+        )
+    })?;
     Ok(path)
 }
 
@@ -301,11 +309,19 @@ fn load_from_root(root_dir: &Path) -> Result<AmbientDiarizationAssetSet, String>
         ));
     }
 
-    let manifest: AmbientDiarizationAssetManifest = serde_json::from_slice(
-        &fs::read(&manifest_path)
-            .map_err(|err| format!("Failed to read ambient diarization manifest {}: {err}", manifest_path.display()))?,
-    )
-    .map_err(|err| format!("Failed to parse ambient diarization manifest {}: {err}", manifest_path.display()))?;
+    let manifest: AmbientDiarizationAssetManifest =
+        serde_json::from_slice(&fs::read(&manifest_path).map_err(|err| {
+            format!(
+                "Failed to read ambient diarization manifest {}: {err}",
+                manifest_path.display()
+            )
+        })?)
+        .map_err(|err| {
+            format!(
+                "Failed to parse ambient diarization manifest {}: {err}",
+                manifest_path.display()
+            )
+        })?;
     manifest.validate(root_dir)?;
 
     Ok(AmbientDiarizationAssetSet {
@@ -324,7 +340,12 @@ fn resolve_root(root: &Path) -> Result<Option<AmbientDiarizationAssetSet>, Strin
     }
 
     let mut version_dirs = fs::read_dir(root)
-        .map_err(|err| format!("Failed to list ambient diarization assets in {}: {err}", root.display()))?
+        .map_err(|err| {
+            format!(
+                "Failed to list ambient diarization assets in {}: {err}",
+                root.display()
+            )
+        })?
         .filter_map(Result::ok)
         .filter(|entry| entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false))
         .filter(|entry| entry.path().join(ASSET_MANIFEST_NAME).is_file())

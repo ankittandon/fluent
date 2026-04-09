@@ -166,10 +166,7 @@ impl Overlay {
         let (vision_scroll, vision_text) = {
             let scroll_frame = CGRect::new(
                 CGPoint::new(PADDING_X, PADDING_Y),
-                CGSize::new(
-                    WINDOW_WIDTH - PADDING_X * 2.0,
-                    VISION_RESPONSE_HEIGHT,
-                ),
+                CGSize::new(WINDOW_WIDTH - PADDING_X * 2.0, VISION_RESPONSE_HEIGHT),
             );
             let scroll = NSTextView::scrollableTextView(mtm);
             scroll.setFrame(scroll_frame);
@@ -341,8 +338,7 @@ impl Overlay {
         let height_diff = h - panel_frame.size.height;
         panel_frame.origin.y -= height_diff;
         panel_frame.size.height = h;
-        self.panel
-            .setFrame_display(panel_frame, true);
+        self.panel.setFrame_display(panel_frame, true);
 
         self.effect_view.setFrame(CGRect::new(
             CGPoint::new(0.0, 0.0),
@@ -358,10 +354,7 @@ impl Overlay {
             ));
             self.vision_scroll.setFrame(CGRect::new(
                 CGPoint::new(PADDING_X, PADDING_Y),
-                CGSize::new(
-                    WINDOW_WIDTH - PADDING_X * 2.0,
-                    VISION_RESPONSE_HEIGHT,
-                ),
+                CGSize::new(WINDOW_WIDTH - PADDING_X * 2.0, VISION_RESPONSE_HEIGHT),
             ));
 
             self.vision_divider.setHidden(false);
@@ -401,8 +394,7 @@ impl Overlay {
         } else {
             self.vision_divider.setHidden(true);
             self.vision_scroll.setHidden(true);
-            self.vision_text
-                .setString(&NSString::from_str(""));
+            self.vision_text.setString(&NSString::from_str(""));
         }
 
         // Re-layout the waveform and transcript for the new height

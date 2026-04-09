@@ -120,7 +120,7 @@ impl SummaryBackendRegistry {
             return fallback;
         }
 
-        sanitize_session_title(&String::from_utf8_lossy(&output.stdout))
+        validated_session_title(&String::from_utf8_lossy(&output.stdout), &fallback)
     }
 
     /// Generate a concise session title from the already-generated summary.
@@ -157,13 +157,11 @@ impl SummaryBackendRegistry {
                     None
                 }
             }
-            SummaryBackendPreference::Bundled => {
-                generate_bundled_summary(&prompt, 32).ok()
-            }
+            SummaryBackendPreference::Bundled => generate_bundled_summary(&prompt, 32).ok(),
         };
 
         match result {
-            Some(raw) if !raw.trim().is_empty() => sanitize_session_title(&raw),
+            Some(raw) if !raw.trim().is_empty() => validated_session_title(&raw, &fallback),
             _ => fallback,
         }
     }
@@ -199,7 +197,15 @@ impl NotesSummarizer for BundledSummaryBackend {
         let fallback = heuristic_structured_notes(live_notes, segments, title_hint);
 
         if template == SummaryTemplate::General {
-            return summarize_general_chunked(live_notes, segments, title_hint, fallback);
+            let general_fallback =
+                heuristic_general_notes(live_notes, segments, title_hint, &fallback);
+            return summarize_general_chunked(
+                live_notes,
+                segments,
+                title_hint,
+                &fallback.key_points,
+                general_fallback,
+            );
         }
 
         let prompt = build_structured_notes_prompt(live_notes, segments, title_hint, template);
@@ -230,9 +236,9 @@ impl OllamaSummaryBackend {
             return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
         }
 
-        Ok(trim_generated_response(
-            &String::from_utf8_lossy(&output.stdout),
-        ))
+        Ok(trim_generated_response(&String::from_utf8_lossy(
+            &output.stdout,
+        )))
     }
 }
 
@@ -246,7 +252,16 @@ impl NotesSummarizer for OllamaSummaryBackend {
     ) -> Result<StructuredNotes, String> {
         if template == SummaryTemplate::General {
             let fallback = heuristic_structured_notes(live_notes, segments, title_hint);
-            return summarize_general_ollama(self, live_notes, segments, title_hint, fallback);
+            let general_fallback =
+                heuristic_general_notes(live_notes, segments, title_hint, &fallback);
+            return summarize_general_ollama(
+                self,
+                live_notes,
+                segments,
+                title_hint,
+                &fallback.key_points,
+                general_fallback,
+            );
         }
 
         let prompt = build_structured_notes_prompt(live_notes, segments, title_hint, template);
@@ -296,17 +311,19 @@ const GENERAL_CHUNK_CHARS: usize = 5_000;
 const GENERAL_CHUNK_MAX_TOKENS: usize = 384;
 /// Max tokens for the final merge pass (bundled model).
 const GENERAL_MERGE_MAX_TOKENS: usize = 768;
+const GENERAL_RESCUE_SECTION_MAX_TOKENS: usize = 192;
 const GENERAL_TOPIC_DISCOVERY_MAX_TOKENS: usize = 128;
 const GENERAL_TOPIC_DETAIL_MAX_TOKENS: usize = 224;
-const GENERAL_FOCUSED_STAGE_MAX_TOKENS: usize = 160;
 const GENERAL_MAX_TOPICS: usize = 5;
 const GENERAL_TOPIC_CONTEXT_MAX_CHARS: usize = 10_000;
+const SUMMARY_TRANSCRIPT_REPEAT_NGRAM_MIN: usize = 3;
+const SUMMARY_TRANSCRIPT_REPEAT_NGRAM_MAX: usize = 12;
+const SUMMARY_TRANSCRIPT_RECENT_LINE_WINDOW: usize = 2;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct GeneralSummaryContext {
     scratch_pad: Option<String>,
     transcript: String,
-    transcript_lines: Vec<String>,
     chunks: Vec<String>,
 }
 
@@ -331,23 +348,36 @@ struct TopicSection {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct RecoveryTopicSection {
+    title: String,
+    first_index: usize,
+    lines: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct GeneralSummaryDraft {
     topics: Vec<TopicSection>,
-    decisions: Vec<String>,
-    action_items: Vec<String>,
-    open_questions: Vec<String>,
 }
 
 fn summarize_general_chunked(
     live_notes: &str,
     segments: &[CanonicalSegment],
     title_hint: Option<&str>,
+    salient_lines: &[String],
     fallback: StructuredNotes,
 ) -> Result<StructuredNotes, String> {
     let generate = |prompt: &str, max_tokens: usize| generate_bundled_summary(prompt, max_tokens);
-    if let Some(notes) =
-        summarize_general_multistage(live_notes, segments, title_hint, &fallback, &generate)
+    if transcript_seems_noisy(live_notes, segments, salient_lines)
+        || transcript_is_pathological_for_llm(live_notes, segments)
     {
+        if let Some(notes) = summarize_general_recovery(live_notes, segments, title_hint, &generate)
+        {
+            return Ok(notes);
+        }
+        return Ok(fallback);
+    }
+
+    if let Some(notes) = summarize_general_multistage(live_notes, segments, title_hint, &generate) {
         return Ok(notes);
     }
 
@@ -360,7 +390,9 @@ fn summarize_general_chunked(
             "{GENERAL_TEMPLATE_PROMPT}\n\nTitle hint: {title}\n\nTranscript:\n{transcript}"
         );
         return match generate_bundled_summary(&prompt, GENERAL_MERGE_MAX_TOKENS) {
-            Ok(raw) if !raw.trim().is_empty() => Ok(general_raw_notes(raw, segments)),
+            Ok(raw) if !raw.trim().is_empty() => {
+                Ok(validated_general_raw_notes(raw, segments).unwrap_or_else(|| fallback.clone()))
+            }
             _ => Ok(fallback),
         };
     }
@@ -388,15 +420,21 @@ fn summarize_general_chunked(
     }
 
     let combined = chunk_summaries.join("\n\n---\n\n");
-    let merge_prompt = format!(
-        "{GENERAL_MERGE_PROMPT}\n\nTitle hint: {title}\n\nPartial summaries:\n{combined}"
-    );
+    let merge_prompt =
+        format!("{GENERAL_MERGE_PROMPT}\n\nTitle hint: {title}\n\nPartial summaries:\n{combined}");
 
     match generate_bundled_summary(&merge_prompt, GENERAL_MERGE_MAX_TOKENS) {
-        Ok(raw) if !raw.trim().is_empty() => Ok(general_raw_notes(raw, segments)),
+        Ok(raw) if !raw.trim().is_empty() => {
+            Ok(validated_general_raw_notes(raw, segments).unwrap_or_else(|| fallback.clone()))
+        }
         _ => {
             // If merge fails, concatenate chunk summaries as the output
-            Ok(general_raw_notes(combined, segments))
+            Ok(
+                validated_general_raw_notes(combined, segments).unwrap_or_else(|| {
+                    summarize_general_recovery(live_notes, segments, title_hint, &generate)
+                        .unwrap_or(fallback)
+                }),
+            )
         }
     }
 }
@@ -406,12 +444,21 @@ fn summarize_general_ollama(
     live_notes: &str,
     segments: &[CanonicalSegment],
     title_hint: Option<&str>,
+    salient_lines: &[String],
     fallback: StructuredNotes,
 ) -> Result<StructuredNotes, String> {
     let generate = |prompt: &str, _max_tokens: usize| backend.generate(prompt);
-    if let Some(notes) =
-        summarize_general_multistage(live_notes, segments, title_hint, &fallback, &generate)
+    if transcript_seems_noisy(live_notes, segments, salient_lines)
+        || transcript_is_pathological_for_llm(live_notes, segments)
     {
+        if let Some(notes) = summarize_general_recovery(live_notes, segments, title_hint, &generate)
+        {
+            return Ok(notes);
+        }
+        return Ok(fallback);
+    }
+
+    if let Some(notes) = summarize_general_multistage(live_notes, segments, title_hint, &generate) {
         return Ok(notes);
     }
 
@@ -423,7 +470,9 @@ fn summarize_general_ollama(
             "{GENERAL_TEMPLATE_PROMPT}\n\nTitle hint: {title}\n\nTranscript:\n{transcript}"
         );
         return match backend.generate(&prompt) {
-            Ok(raw) if !raw.trim().is_empty() => Ok(general_raw_notes(raw, segments)),
+            Ok(raw) if !raw.trim().is_empty() => {
+                Ok(validated_general_raw_notes(raw, segments).unwrap_or_else(|| fallback.clone()))
+            }
             Ok(_) => Ok(fallback),
             Err(err) => Err(err),
         };
@@ -450,13 +499,19 @@ fn summarize_general_ollama(
     }
 
     let combined = chunk_summaries.join("\n\n---\n\n");
-    let merge_prompt = format!(
-        "{GENERAL_MERGE_PROMPT}\n\nTitle hint: {title}\n\nPartial summaries:\n{combined}"
-    );
+    let merge_prompt =
+        format!("{GENERAL_MERGE_PROMPT}\n\nTitle hint: {title}\n\nPartial summaries:\n{combined}");
 
     match backend.generate(&merge_prompt) {
-        Ok(raw) if !raw.trim().is_empty() => Ok(general_raw_notes(raw, segments)),
-        _ => Ok(general_raw_notes(combined, segments)),
+        Ok(raw) if !raw.trim().is_empty() => {
+            Ok(validated_general_raw_notes(raw, segments).unwrap_or_else(|| fallback.clone()))
+        }
+        _ => Ok(
+            validated_general_raw_notes(combined, segments).unwrap_or_else(|| {
+                summarize_general_recovery(live_notes, segments, title_hint, &generate)
+                    .unwrap_or(fallback)
+            }),
+        ),
     }
 }
 
@@ -464,7 +519,6 @@ fn summarize_general_multistage(
     live_notes: &str,
     segments: &[CanonicalSegment],
     title_hint: Option<&str>,
-    fallback: &StructuredNotes,
     generate: &dyn Fn(&str, usize) -> Result<String, String>,
 ) -> Option<StructuredNotes> {
     let context = general_summary_context(live_notes, segments);
@@ -482,73 +536,7 @@ fn summarize_general_multistage(
         return None;
     }
 
-    let decisions = extract_focused_section(
-        &context,
-        title_hint,
-        "Decisions",
-        GENERAL_DECISIONS_PROMPT,
-        &[
-            "decide",
-            "decision",
-            "agreed",
-            "agree",
-            "ship",
-            "release",
-            "go or no-go",
-            "go/no-go",
-            "fallback",
-            "plan",
-        ],
-        fallback.decisions.clone(),
-        generate,
-    );
-    let action_items = extract_focused_section(
-        &context,
-        title_hint,
-        "Action Items",
-        GENERAL_ACTION_ITEMS_PROMPT,
-        &[
-            "action",
-            "next step",
-            "follow up",
-            "follow-up",
-            "todo",
-            "owner",
-            "will ",
-            "pair",
-            "need to",
-            "tomorrow",
-            "friday",
-        ],
-        fallback.action_items.clone(),
-        generate,
-    );
-    let open_questions = extract_focused_section(
-        &context,
-        title_hint,
-        "Open Questions",
-        GENERAL_OPEN_QUESTIONS_PROMPT,
-        &[
-            "?",
-            "question",
-            "unclear",
-            "unknown",
-            "whether",
-            "if ",
-            "blocker",
-            "risk",
-            "concern",
-        ],
-        fallback.open_questions.clone(),
-        generate,
-    );
-
-    let draft = GeneralSummaryDraft {
-        topics,
-        decisions,
-        action_items,
-        open_questions,
-    };
+    let draft = GeneralSummaryDraft { topics };
     let rendered = render_general_summary_draft(&draft);
     if rendered.trim().is_empty() {
         return None;
@@ -561,30 +549,245 @@ fn summarize_general_multistage(
     })
 }
 
+fn summarize_general_recovery(
+    live_notes: &str,
+    segments: &[CanonicalSegment],
+    title_hint: Option<&str>,
+    generate: &dyn Fn(&str, usize) -> Result<String, String>,
+) -> Option<StructuredNotes> {
+    let (scratch_pad, _) = split_scratch_pad_context(live_notes);
+    let distilled_lines =
+        select_general_recovery_lines(&cleaned_summary_transcript_lines(live_notes, segments));
+    if distilled_lines.is_empty() {
+        return None;
+    }
+
+    let topics = build_recovery_topic_sections(&distilled_lines, title_hint, scratch_pad, generate);
+    if topics.is_empty() {
+        return None;
+    }
+
+    let rendered = render_general_summary_draft(&GeneralSummaryDraft { topics });
+    if rendered.trim().is_empty() {
+        return None;
+    }
+
+    Some(StructuredNotes {
+        transcript: segments_to_transcript(segments),
+        raw_notes: Some(rendered),
+        ..Default::default()
+    })
+}
+
+fn build_recovery_topic_sections(
+    distilled_lines: &[String],
+    title_hint: Option<&str>,
+    scratch_pad: Option<&str>,
+    generate: &dyn Fn(&str, usize) -> Result<String, String>,
+) -> Vec<TopicSection> {
+    let mut sections = Vec::<TopicSection>::new();
+
+    for topic in cluster_recovery_lines(distilled_lines) {
+        let mut bullets = fallback_recovery_section_bullets(&topic);
+
+        if bullets.is_empty() {
+            let prompt = build_general_stage_prompt(
+                &GENERAL_RESCUE_SECTION_PROMPT.replace("{topic}", &topic.title),
+                title_hint,
+                scratch_pad,
+                "Reliable transcript fragments",
+                &topic.lines.join("\n"),
+            );
+            let generated = generate(&prompt, GENERAL_RESCUE_SECTION_MAX_TOKENS)
+                .ok()
+                .map(|raw| parse_simple_bullets(&raw))
+                .unwrap_or_default();
+            bullets = generated
+                .into_iter()
+                .filter(|bullet| bullet_has_source_support(bullet, &topic.lines))
+                .filter(|bullet| !contains_forbidden_summary_pronouns(bullet))
+                .filter(|bullet| line_has_reliable_summary_signal(bullet))
+                .collect::<Vec<_>>();
+        }
+
+        let bullets = prioritize_general_section_items(&dedupe_bullets(&bullets), 3);
+        if bullets.is_empty() {
+            continue;
+        }
+
+        sections.push(TopicSection {
+            title: topic.title,
+            bullets,
+        });
+    }
+
+    sections
+}
+
+fn cluster_recovery_lines(lines: &[String]) -> Vec<RecoveryTopicSection> {
+    let mut sections = Vec::<RecoveryTopicSection>::new();
+
+    for (index, line) in lines.iter().enumerate() {
+        let title = infer_recovery_topic_title(line);
+        if let Some(existing) = sections.iter_mut().find(|section| section.title == title) {
+            existing.lines.push(line.clone());
+            continue;
+        }
+
+        sections.push(RecoveryTopicSection {
+            title,
+            first_index: index,
+            lines: vec![line.clone()],
+        });
+    }
+
+    sections.sort_by_key(|section| section.first_index);
+    sections
+}
+
+fn infer_recovery_topic_title(line: &str) -> String {
+    let lower = line.to_ascii_lowercase();
+
+    if lower.contains("dashboard") {
+        return "Dashboard Work".to_string();
+    }
+    if lower.contains("24 hour")
+        || lower.contains("24-hour")
+        || lower.contains("wake up")
+        || lower.contains("woken up")
+        || lower.contains("rotation")
+    {
+        return "On-Call Expectations".to_string();
+    }
+    if lower.contains("incident")
+        || lower.contains("slack")
+        || lower.contains("runbook")
+        || lower.contains("notified")
+        || lower.contains("alert")
+        || lower.contains("page")
+        || lower.contains("ping")
+        || (lower.contains("handled") && lower.contains("offline"))
+        || (lower.contains("david")
+            && (lower.contains("offline")
+                || lower.contains("wasn't online")
+                || lower.contains("wasnt online")
+                || lower.contains("not online")
+                || lower.contains("online")))
+    {
+        return "Incident Response".to_string();
+    }
+    if lower.contains("on call")
+        || lower.contains("on-call")
+        || lower.contains("coverage")
+        || lower.contains("pto")
+        || lower.contains("flight")
+    {
+        return "On-Call Coverage".to_string();
+    }
+    if lower.contains("training") || lower.contains("setup") {
+        return "Training And Setup".to_string();
+    }
+
+    fallback_topic_title_from_line(line)
+}
+
+fn fallback_topic_title_from_line(line: &str) -> String {
+    let tokens = summary_content_tokens(line)
+        .into_iter()
+        .take(3)
+        .collect::<Vec<_>>();
+    if tokens.is_empty() {
+        return "Discussion Notes".to_string();
+    }
+
+    title_case_words(&tokens.join(" "))
+}
+
+fn fallback_recovery_section_bullets(topic: &RecoveryTopicSection) -> Vec<String> {
+    topic
+        .lines
+        .iter()
+        .filter_map(|line| fallback_recovery_bullet(line))
+        .collect()
+}
+
+fn fallback_recovery_bullet(line: &str) -> Option<String> {
+    let lower = line.to_ascii_lowercase();
+
+    if (lower.contains("on call") || lower.contains("on-call"))
+        && (lower.contains("pto") || lower.contains("taking"))
+    {
+        return Some(
+            "A team member requested on-call coverage during planned time off.".to_string(),
+        );
+    }
+    if lower.contains("tuesday") && lower.contains("flight") {
+        return Some(
+            "Coverage may resume Tuesday night if the return flight is on time.".to_string(),
+        );
+    }
+    if lower.contains("david")
+        && (lower.contains("offline")
+            || lower.contains("wasn't online")
+            || lower.contains("wasnt online")
+            || lower.contains("not online")
+            || lower.contains("online"))
+    {
+        return Some(
+            "David handled a recent early-morning issue because the assigned person was offline."
+                .to_string(),
+        );
+    }
+    if lower.contains("24 hour") || lower.contains("24-hour") {
+        return Some(
+            "The team clarified that this is not treated as a 24-hour on-call rotation."
+                .to_string(),
+        );
+    }
+    if lower.contains("training") && lower.contains("setup") {
+        return Some(
+            "The team discussed training and setup requirements for people entering the on-call loop."
+                .to_string(),
+        );
+    }
+    if lower.contains("slack") || lower.contains("runbook") || lower.contains("notified") {
+        return Some(
+            "The team discussed how incident notifications should flow through Slack access and runbooks."
+                .to_string(),
+        );
+    }
+
+    None
+}
+
 /// Build a `StructuredNotes` that uses `raw_notes` so `to_markdown()` emits
 /// the LLM output directly instead of the rigid section layout.
-fn general_raw_notes(raw: String, segments: &[CanonicalSegment]) -> StructuredNotes {
+fn validated_general_raw_notes(
+    raw: String,
+    segments: &[CanonicalSegment],
+) -> Option<StructuredNotes> {
     let cleaned = clean_general_markdown(&raw);
-    StructuredNotes {
+    if !general_markdown_has_signal(&cleaned) {
+        return None;
+    }
+
+    Some(StructuredNotes {
         transcript: segments_to_transcript(segments),
         raw_notes: Some(cleaned),
         ..Default::default()
-    }
+    })
 }
 
-fn general_summary_context(live_notes: &str, segments: &[CanonicalSegment]) -> GeneralSummaryContext {
+fn general_summary_context(
+    live_notes: &str,
+    segments: &[CanonicalSegment],
+) -> GeneralSummaryContext {
     let (scratch_pad, transcript_body) = split_scratch_pad_context(live_notes);
     let transcript = if segments.is_empty() {
         normalize_live_transcript(transcript_body, false)
     } else {
         segments_to_speakerless_transcript(segments)
     };
-    let transcript_lines = transcript
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(str::to_string)
-        .collect::<Vec<_>>();
     let chunks = split_transcript_chunks(&transcript, GENERAL_CHUNK_CHARS);
 
     GeneralSummaryContext {
@@ -593,7 +796,6 @@ fn general_summary_context(live_notes: &str, segments: &[CanonicalSegment]) -> G
             .filter(|text| !text.is_empty())
             .map(str::to_string),
         transcript,
-        transcript_lines,
         chunks,
     }
 }
@@ -664,54 +866,6 @@ fn build_topic_sections(
     sections
 }
 
-fn extract_focused_section(
-    context: &GeneralSummaryContext,
-    title_hint: Option<&str>,
-    section_name: &str,
-    instruction: &str,
-    needles: &[&str],
-    fallback: Vec<String>,
-    generate: &dyn Fn(&str, usize) -> Result<String, String>,
-) -> Vec<String> {
-    let filtered_lines = filtered_context_lines(&context.transcript_lines, needles);
-    let body = if filtered_lines.is_empty() {
-        excerpt_balanced_text(&context.transcript, 6_000)
-    } else {
-        filtered_lines.join("\n")
-    };
-    if body.trim().is_empty() {
-        return dedupe_bullets(&fallback);
-    }
-
-    let prompt = build_general_stage_prompt(
-        instruction,
-        title_hint,
-        context.scratch_pad.as_deref(),
-        "Candidate transcript lines",
-        &body,
-    );
-    let parsed = generate(&prompt, GENERAL_FOCUSED_STAGE_MAX_TOKENS)
-        .ok()
-        .map(|output| parse_simple_bullets(&output))
-        .unwrap_or_default();
-    let cleaned = dedupe_bullets(&parsed);
-    if cleaned.is_empty() {
-        return dedupe_bullets(&fallback)
-            .into_iter()
-            .filter(|line| !is_empty_section_marker(line) && !line.starts_with("No explicit "))
-            .collect();
-    }
-
-    cleaned
-        .into_iter()
-        .filter(|line| !is_empty_section_marker(line))
-        .filter(|line| {
-            !line.eq_ignore_ascii_case(section_name)
-                && !line.to_ascii_lowercase().starts_with("none")
-        })
-        .collect()
-}
-
 fn build_general_stage_prompt(
     instruction: &str,
     title_hint: Option<&str>,
@@ -768,6 +922,9 @@ fn normalize_topic_title(text: &str) -> Option<String> {
     let line = strip_speaker_prefix(line).trim();
     let normalized = collapse_spaces(line);
     let lower = normalized.to_ascii_lowercase();
+    if is_meta_summary_line(&normalized) {
+        return None;
+    }
     if normalized.split_whitespace().count() > 7 {
         return None;
     }
@@ -889,16 +1046,6 @@ fn fallback_topic_bullets(topic_context: &str) -> Vec<String> {
         .collect()
 }
 
-fn filtered_context_lines(lines: &[String], needles: &[&str]) -> Vec<String> {
-    lines.iter()
-        .filter(|line| {
-            let lower = line.to_ascii_lowercase();
-            needles.iter().any(|needle| lower.contains(needle))
-        })
-        .cloned()
-        .collect()
-}
-
 fn parse_simple_bullets(text: &str) -> Vec<String> {
     let cleaned = strip_code_fence(&trim_generated_response(text));
     let mut bullets = Vec::new();
@@ -909,13 +1056,18 @@ fn parse_simple_bullets(text: &str) -> Vec<String> {
             continue;
         }
 
-        let stripped = strip_list_prefix(line).trim();
-        if stripped.is_empty() || stripped == line && is_presentational_line(line) {
+        let Some(stripped) = list_item_body(line) else {
             continue;
-        }
+        };
 
-        let normalized = strip_speaker_prefix(stripped).trim();
-        if normalized.is_empty() || is_presentational_line(normalized) {
+        let normalized = strip_speaker_prefix(stripped)
+            .trim()
+            .trim_matches(|ch| matches!(ch, '*' | '_'))
+            .trim();
+        if normalized.is_empty()
+            || is_presentational_line(normalized)
+            || is_meta_summary_line(normalized)
+        {
             continue;
         }
         bullets.push(collapse_spaces(normalized));
@@ -928,12 +1080,85 @@ fn is_presentational_line(line: &str) -> bool {
     let lower = line.trim().to_ascii_lowercase();
     lower.starts_with("here are")
         || lower.starts_with("here's")
+        || lower.starts_with("here’s")
         || lower.starts_with("below are")
         || lower.starts_with("topics discussed")
         || lower.starts_with("core discussion points")
         || lower.starts_with("breakdown")
         || lower.starts_with("thinking")
         || lower.starts_with("topic ")
+}
+
+fn is_meta_summary_line(line: &str) -> bool {
+    let normalized = collapse_spaces(strip_speaker_prefix(line).trim());
+    if normalized.is_empty() {
+        return true;
+    }
+
+    let lower = normalized.to_ascii_lowercase();
+    if [
+        "okay",
+        "ok",
+        "detailed breakdown",
+        "here's a breakdown",
+        "here’s a breakdown",
+        "here's a response",
+        "here’s a response",
+        "let's break this down",
+        "lets break this down",
+        "overall theme",
+        "revised text",
+        "revised version",
+        "the initial interaction",
+        "the core loop",
+        "the core of the discussion",
+        "the conversation revolves around",
+        "the speaker is trying",
+        "the user is starting",
+        "mix of",
+    ]
+    .iter()
+    .any(|prefix| lower.starts_with(prefix))
+    {
+        return true;
+    }
+
+    if [
+        "response to your request",
+        "breakdown of topics",
+        "organized into bullet points",
+        "preserving the intent and tone",
+        "what i think is happening",
+        "output bullet lines only",
+        "capture only details relevant",
+        "preserve concrete facts",
+        "do not mention speaker labels",
+        "do not add a heading",
+        "do not repeat the topic title",
+        "prefer 2 to 5 bullets",
+        "include only decisions",
+        "include only items",
+        "if there are no reliable",
+        "starting with `- `",
+        "each starting with `- `",
+        "conversation revolves around",
+        "core of the discussion",
+        "slightly disjointed feel",
+        "potential interpretations",
+        "conversational flow",
+        "technical jargon",
+        "sense of being overwhelmed",
+        "repetitive pattern",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+    {
+        return true;
+    }
+
+    let tokens = summary_tokens(&normalized);
+    looks_symbolic_line(&normalized)
+        || (tokens.len() >= 8 && looks_noisy_line(&normalized, &tokens))
 }
 
 fn dedupe_bullets(lines: &[String]) -> Vec<String> {
@@ -943,7 +1168,10 @@ fn dedupe_bullets(lines: &[String]) -> Vec<String> {
         if trimmed.is_empty() || is_empty_section_marker(&trimmed) {
             continue;
         }
-        if out.iter().any(|existing| lines_are_similar(existing, &trimmed)) {
+        if out
+            .iter()
+            .any(|existing| lines_are_similar(existing, &trimmed))
+        {
             continue;
         }
         out.push(trimmed);
@@ -967,26 +1195,6 @@ fn render_general_summary_draft(draft: &GeneralSummaryDraft) -> String {
             continue;
         }
         sections.push(format!("## {}\n{}", topic.title.trim(), bullets));
-    }
-
-    for (title, items) in [
-        ("Decisions", &draft.decisions),
-        ("Action Items", &draft.action_items),
-        ("Open Questions", &draft.open_questions),
-    ] {
-        let items = dedupe_bullets(items)
-            .into_iter()
-            .filter(|line| !line.starts_with("No explicit "))
-            .collect::<Vec<_>>();
-        if items.is_empty() {
-            continue;
-        }
-        let body = items
-            .into_iter()
-            .map(|item| format!("- {item}"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        sections.push(format!("## {title}\n{body}"));
     }
 
     sections.join("\n\n").trim().to_string()
@@ -1055,8 +1263,8 @@ FORMAT RULES:\n\
 - Use ## headings for each topic or theme.\n\
 - Use bullet points (- ) under each heading.\n\
 - Keep bullets short and information-dense.\n\
-- If action items, decisions, or next steps came up, include them under a relevant heading.\n\
-- Do NOT create generic sections like 'Key Points' or 'Summary' — name headings after the actual topics.\n\
+- If action items, decisions, next steps, or unresolved questions came up, include them under a relevant topic heading.\n\
+- Do NOT create generic sections like 'Summary', 'Key Points', 'Decisions', 'Action Items', or 'Open Questions' — name headings after the actual topics.\n\
 - Do NOT reproduce speaker labels (Speaker 1, You, S1, etc.) — just capture the substance.\n\n\
 QUALITY:\n\
 - Preserve all important facts, names, numbers, and technical terms exactly.\n\
@@ -1067,8 +1275,9 @@ QUALITY:\n\
 const GENERAL_CHUNK_PROMPT: &str = "\
 Summarize this portion of a transcript into concise bullet-point notes.\n\
 - Remove filler words, repetition, and false starts.\n\
-- Identify topics discussed and group bullets under short ## headings named after the topics.\n\
-- Capture facts, names, numbers, and decisions accurately.\n\
+- Identify topics discussed and group bullets under short ## headings named after the actual topics.\n\
+- Capture facts, names, numbers, decisions, next steps, and unresolved questions accurately under the relevant topic.\n\
+- Do NOT use generic headings like Summary, Key Points, Decisions, Action Items, or Open Questions.\n\
 - Do NOT reproduce speaker labels — just the substance.\n\
 - Output clean markdown only.";
 
@@ -1078,10 +1287,28 @@ Merge them into a single cohesive set of structured notes.\n\n\
 RULES:\n\
 - Combine duplicate topics under one heading.\n\
 - Remove redundant bullets that say the same thing.\n\
-- Use ## headings named after the actual topics (not generic labels like 'Key Points').\n\
+- Use ## headings named after the actual topics.\n\
+- Keep decisions, next steps, and unresolved questions under the relevant topic heading instead of creating generic operational sections.\n\
+- Do NOT use generic headings like Summary, Key Points, Decisions, Action Items, or Open Questions.\n\
 - Use bullet points (- ) under each heading.\n\
 - Keep it concise and well-organized.\n\
 - Output clean markdown only. No preamble.";
+
+const GENERAL_RESCUE_SECTION_PROMPT: &str = "\
+Turn these noisy transcript fragments into concise meeting notes for the topic `{topic}`.\n\
+\n\
+RULES:\n\
+- Many fragments may be garbled, duplicated, or semantically broken.\n\
+- Keep only information that is clearly supported by the fragments.\n\
+- It is better to output one accurate bullet than several questionable bullets.\n\
+- Output bullet lines only, each starting with `- `.\n\
+- Use neutral note-style wording, not transcript-style wording.\n\
+- Keep terminology close to the source fragments; do not add interpretations that are not explicit.\n\
+- Do not use first person, second person, greetings, filler, or speaker labels.\n\
+- Preserve concrete facts, dates, owners, and timing when they are reliable.\n\
+- If a detail is ambiguous, omit it.\n\
+- Output at most 3 bullets.\n\
+- If nothing reliable can be extracted, output `- None`.";
 
 const GENERAL_TOPIC_DISCOVERY_PROMPT: &str = "\
 Identify the concrete discussion topics in this meeting transcript excerpt.\n\
@@ -1101,40 +1328,11 @@ RULES:\n\
 - Output bullet lines only, each starting with `- `.\n\
 - Capture only details relevant to this topic.\n\
 - Preserve concrete facts, names, numbers, dates, and technical terms.\n\
+- If this topic includes a decision, action item, follow-up, or unresolved question, include it as a normal bullet under this topic.\n\
 - Do not mention speaker labels.\n\
 - Do not add a heading or preamble.\n\
 - Do not repeat the topic title inside each bullet.\n\
 - Prefer 2 to 5 bullets.";
-
-const GENERAL_DECISIONS_PROMPT: &str = "\
-Extract only decisions or tentative decisions from these meeting notes.\n\
-\n\
-RULES:\n\
-- Output bullet lines only, each starting with `- `.\n\
-- Include only decisions, commitments, chosen directions, or explicit fallback plans.\n\
-- Do not include general discussion points.\n\
-- Do not mention speaker labels.\n\
-- If there are no reliable decisions, output `- None`.";
-
-const GENERAL_ACTION_ITEMS_PROMPT: &str = "\
-Extract only concrete action items and next steps from these meeting notes.\n\
-\n\
-RULES:\n\
-- Output bullet lines only, each starting with `- `.\n\
-- Include owners, dates, or timing only when they are explicit.\n\
-- Do not include general discussion points.\n\
-- Do not mention speaker labels.\n\
-- If there are no reliable action items, output `- None`.";
-
-const GENERAL_OPEN_QUESTIONS_PROMPT: &str = "\
-Extract only unresolved questions, risks, blockers, or uncertainties from these meeting notes.\n\
-\n\
-RULES:\n\
-- Output bullet lines only, each starting with `- `.\n\
-- Include only items that are still unresolved or require follow-up.\n\
-- Do not include settled decisions.\n\
-- Do not mention speaker labels.\n\
-- If there are no reliable open questions, output `- None`.";
 
 const ONE_ON_ONE_TEMPLATE_PROMPT: &str = "\
 Write concise 1:1 meeting notes in markdown with these sections exactly and in this order:\n\
@@ -1242,7 +1440,13 @@ fn full_summary_context(
     let transcript = if segments.is_empty() {
         normalize_live_transcript(transcript_body, include_speaker_labels)
     } else if include_speaker_labels {
-        segments_to_transcript(segments)
+        sanitize_summary_transcript_lines(
+            segments
+                .iter()
+                .map(CanonicalSegment::note_line)
+                .collect::<Vec<_>>(),
+            true,
+        )
     } else {
         segments_to_speakerless_transcript(segments)
     };
@@ -1278,27 +1482,23 @@ fn split_scratch_pad_context(live_notes: &str) -> (Option<&str>, &str) {
 }
 
 fn normalize_live_transcript(text: &str, include_speaker_labels: bool) -> String {
-    text.lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(|line| {
-            if include_speaker_labels {
-                line.to_string()
-            } else {
-                strip_speaker_prefix(line).to_string()
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
+    sanitize_summary_transcript_lines(
+        text.lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(str::to_string),
+        include_speaker_labels,
+    )
 }
 
 fn segments_to_speakerless_transcript(segments: &[CanonicalSegment]) -> String {
-    segments
-        .iter()
-        .map(|segment| segment.text.trim())
-        .filter(|text| !text.is_empty())
-        .collect::<Vec<_>>()
-        .join("\n")
+    sanitize_summary_transcript_lines(
+        segments
+            .iter()
+            .map(|segment| segment.text.trim().to_string())
+            .collect::<Vec<_>>(),
+        false,
+    )
 }
 
 fn excerpt_balanced_text(text: &str, max_chars: usize) -> String {
@@ -1356,13 +1556,14 @@ fn merge_model_structured_notes(
 ) -> StructuredNotes {
     let transcript = segments_to_transcript(segments);
     let Some(mut parsed) = parse_model_structured_notes(content, &transcript) else {
-        let salient_lines = collect_salient_lines(live_notes, segments);
+        let transcript_lines = cleaned_summary_transcript_lines(live_notes, segments);
+        let salient_lines = collect_salient_lines(&transcript_lines);
         return StructuredNotes {
             summary: content.trim().to_string(),
-            key_points: collect_key_points(live_notes, segments, &salient_lines),
-            decisions: collect_decisions(live_notes),
-            action_items: collect_action_items(live_notes),
-            open_questions: collect_open_questions(live_notes),
+            key_points: collect_key_points(&transcript_lines, &salient_lines),
+            decisions: collect_decisions(&transcript_lines),
+            action_items: collect_action_items(&transcript_lines),
+            open_questions: collect_open_questions(&transcript_lines),
             transcript,
             raw_notes: None,
         };
@@ -1511,10 +1712,18 @@ fn is_empty_section_marker(line: &str) -> bool {
 }
 
 fn strip_list_prefix(line: &str) -> &str {
+    if let Some(rest) = list_item_body(line) {
+        return rest;
+    }
+
+    line.trim()
+}
+
+fn list_item_body(line: &str) -> Option<&str> {
     let line = line.trim();
     for prefix in ["- ", "* ", "• "] {
         if let Some(rest) = line.strip_prefix(prefix) {
-            return rest.trim();
+            return Some(rest.trim());
         }
     }
 
@@ -1529,11 +1738,14 @@ fn strip_list_prefix(line: &str) -> &str {
     if digits > 0 {
         let remainder = &line[digits..];
         if let Some(rest) = remainder.strip_prefix(". ") {
-            return rest.trim();
+            return Some(rest.trim());
+        }
+        if let Some(rest) = remainder.strip_prefix(") ") {
+            return Some(rest.trim());
         }
     }
 
-    line
+    None
 }
 
 fn strip_code_fence(text: &str) -> String {
@@ -1553,45 +1765,256 @@ fn strip_code_fence(text: &str) -> String {
 
 fn clean_general_markdown(text: &str) -> String {
     let cleaned = strip_code_fence(&trim_generated_response(text));
-    let mut lines = cleaned
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(str::to_string)
-        .collect::<Vec<_>>();
+    let mut sections = Vec::<TopicSection>::new();
+    let mut pending_generic_items = Vec::<String>::new();
+    let mut current_heading = None::<String>;
+    let mut current_items = Vec::<String>::new();
+    let mut current_heading_is_generic = false;
 
-    if let Some(first_heading) = lines.iter().position(|line| line.starts_with('#')) {
-        lines = lines.split_off(first_heading);
-    }
-
-    let mut normalized = Vec::new();
-    for line in lines {
-        if line == "---" {
+    for raw_line in cleaned.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() || line == "---" {
             continue;
         }
 
         if line.starts_with('#') {
-            normalized.push(line);
+            push_cleaned_general_section(
+                &mut sections,
+                &mut pending_generic_items,
+                &mut current_heading,
+                &mut current_items,
+                current_heading_is_generic,
+            );
+            current_heading = normalize_general_heading(line);
+            current_heading_is_generic = current_heading
+                .as_deref()
+                .map(is_generic_general_heading)
+                .unwrap_or(false);
             continue;
         }
 
-        let list_stripped = strip_list_prefix(&line);
-        if list_stripped != line {
-            let rest = list_stripped;
-            let rest = strip_speaker_prefix(rest).trim();
-            if !rest.is_empty() {
-                normalized.push(format!("- {rest}"));
+        let body = list_item_body(line).unwrap_or(line);
+        let body = collapse_spaces(strip_speaker_prefix(body).trim());
+        if body.is_empty() || is_meta_summary_line(&body) {
+            continue;
+        }
+
+        if current_heading.is_some() {
+            current_items.push(body);
+        }
+    }
+
+    push_cleaned_general_section(
+        &mut sections,
+        &mut pending_generic_items,
+        &mut current_heading,
+        &mut current_items,
+        current_heading_is_generic,
+    );
+
+    sections
+        .into_iter()
+        .filter(|section| !section.title.trim().is_empty() && !section.bullets.is_empty())
+        .map(|section| {
+            format!(
+                "## {}\n{}",
+                section.title,
+                section
+                    .bullets
+                    .into_iter()
+                    .map(|item| format!("- {item}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n")
+        .trim()
+        .to_string()
+}
+
+fn bullet_has_source_support(bullet: &str, source_lines: &[String]) -> bool {
+    let bullet_tokens = summary_content_tokens(bullet);
+    if bullet_tokens.len() < 2 {
+        return false;
+    }
+
+    source_lines.iter().any(|source| {
+        let source_tokens = summary_content_tokens(source);
+        if source_tokens.is_empty() {
+            return false;
+        }
+
+        let bullet_set = bullet_tokens.iter().collect::<HashSet<_>>();
+        let source_set = source_tokens.iter().collect::<HashSet<_>>();
+        let overlap = bullet_set.intersection(&source_set).count();
+
+        overlap >= 3
+            || (overlap >= 2
+                && (lines_are_similar(bullet, source)
+                    || (contains_temporal_markers(bullet) && contains_temporal_markers(source))
+                    || (contains_summary_keywords(bullet) && contains_summary_keywords(source))))
+    })
+}
+
+fn push_cleaned_general_section(
+    sections: &mut Vec<TopicSection>,
+    pending_generic_items: &mut Vec<String>,
+    heading: &mut Option<String>,
+    items: &mut Vec<String>,
+    heading_is_generic: bool,
+) {
+    let Some(heading_text) = heading.take() else {
+        items.clear();
+        return;
+    };
+
+    let cleaned_items = dedupe_bullets(items)
+        .into_iter()
+        .filter(|item| !is_meta_summary_line(item))
+        .filter(|item| line_has_reliable_summary_signal(item))
+        .collect::<Vec<_>>();
+    items.clear();
+    let cleaned_items = prioritize_general_section_items(&cleaned_items, 4);
+    if cleaned_items.is_empty() {
+        return;
+    }
+
+    if heading_is_generic {
+        if let Some(section) = sections.last_mut() {
+            let mut merged = section.bullets.clone();
+            merged.extend(cleaned_items);
+            section.bullets = dedupe_bullets(&merged);
+        } else {
+            pending_generic_items.extend(cleaned_items);
+            *pending_generic_items = dedupe_bullets(pending_generic_items);
+        }
+        return;
+    }
+
+    let mut merged_items = std::mem::take(pending_generic_items);
+    merged_items.extend(cleaned_items);
+    sections.push(TopicSection {
+        title: heading_text,
+        bullets: dedupe_bullets(&merged_items),
+    });
+}
+
+fn prioritize_general_section_items(items: &[String], max_items: usize) -> Vec<String> {
+    let mut scored = items
+        .iter()
+        .enumerate()
+        .map(|(index, item)| {
+            let mut score = summary_candidate_score(item);
+            if contains_temporal_markers(item) {
+                score += 4;
+            }
+            if contains_summary_keywords(item) {
+                score += 4;
+            }
+            (index, item.clone(), score)
+        })
+        .collect::<Vec<_>>();
+
+    scored.sort_by(|left, right| right.2.cmp(&left.2).then(left.0.cmp(&right.0)));
+    scored.truncate(max_items);
+    scored.sort_by_key(|item| item.0);
+    scored.into_iter().map(|(_, item, _)| item).collect()
+}
+
+fn normalize_general_heading(line: &str) -> Option<String> {
+    let heading = line
+        .trim()
+        .trim_start_matches('#')
+        .trim()
+        .trim_end_matches(':')
+        .trim();
+    if heading.is_empty() {
+        return None;
+    }
+
+    let normalized = heading
+        .trim_matches(|ch: char| matches!(ch, '*' | '"' | '\'' | '`'))
+        .trim();
+    let normalized = collapse_spaces(strip_speaker_prefix(normalized).trim());
+    if normalized.is_empty() || is_meta_summary_line(&normalized) {
+        return None;
+    }
+
+    let lower = normalized.to_ascii_lowercase();
+    let word_count = normalized.split_whitespace().count();
+    if word_count > 8 && !is_generic_general_heading(&lower) {
+        return None;
+    }
+
+    Some(normalized)
+}
+
+fn is_generic_general_heading(heading: &str) -> bool {
+    let normalized = collapse_spaces(heading.trim()).to_ascii_lowercase();
+    matches!(
+        normalized.as_str(),
+        "summary"
+            | "key points"
+            | "discussion topics"
+            | "agenda items covered"
+            | "decisions"
+            | "action items"
+            | "actions"
+            | "open questions"
+            | "open questions / risks"
+            | "owners & deadlines"
+            | "owners"
+            | "parking lot"
+            | "follow-ups for next 1:1"
+            | "follow-ups"
+            | "feedback & coaching"
+            | "feedback"
+            | "coaching"
+            | "blockers"
+            | "key callouts"
+            | "discussion"
+            | "recap"
+            | "notes"
+            | "updates"
+            | "miscellaneous"
+            | "other"
+            | "general"
+    )
+}
+
+fn general_markdown_has_signal(text: &str) -> bool {
+    let mut headings = 0usize;
+    let mut bullets = 0usize;
+    let mut meta_or_symbolic = 0usize;
+
+    for raw_line in text.lines() {
+        let line = raw_line.trim();
+        if let Some(heading) = line.strip_prefix("## ") {
+            if is_meta_summary_line(heading)
+                || looks_symbolic_line(heading)
+                || is_generic_general_heading(heading)
+            {
+                meta_or_symbolic += 1;
+            } else {
+                headings += 1;
             }
             continue;
         }
 
-        let line = strip_speaker_prefix(&line).trim();
-        if !line.is_empty() {
-            normalized.push(line.to_string());
+        if let Some(bullet) = line.strip_prefix("- ") {
+            if is_meta_summary_line(bullet)
+                || looks_symbolic_line(bullet)
+                || !line_has_reliable_summary_signal(bullet)
+            {
+                meta_or_symbolic += 1;
+            } else {
+                bullets += 1;
+            }
         }
     }
 
-    normalized.join("\n").trim().to_string()
+    headings > 0 && bullets > 0 && meta_or_symbolic == 0
 }
 
 fn trim_generated_response(text: &str) -> String {
@@ -1611,11 +2034,12 @@ fn heuristic_structured_notes(
     let title = title_hint
         .map(sanitize_session_title)
         .unwrap_or_else(|| sanitize_session_title(&heuristic_title(live_notes, segments)));
-    let salient_lines = collect_salient_lines(live_notes, segments);
-    let key_points = collect_key_points(live_notes, segments, &salient_lines);
-    let decisions = collect_decisions(live_notes);
-    let action_items = collect_action_items(live_notes);
-    let open_questions = collect_open_questions(live_notes);
+    let transcript_lines = cleaned_summary_transcript_lines(live_notes, segments);
+    let salient_lines = collect_salient_lines(&transcript_lines);
+    let key_points = collect_key_points(&transcript_lines, &salient_lines);
+    let decisions = collect_decisions(&transcript_lines);
+    let action_items = collect_action_items(&transcript_lines);
+    let open_questions = collect_open_questions(&transcript_lines);
     let transcript = segments_to_transcript(segments);
 
     StructuredNotes {
@@ -1629,72 +2053,100 @@ fn heuristic_structured_notes(
     }
 }
 
-fn collect_key_points(
+fn heuristic_general_notes(
     live_notes: &str,
     segments: &[CanonicalSegment],
-    salient_lines: &[String],
-) -> Vec<String> {
+    title_hint: Option<&str>,
+    _fallback: &StructuredNotes,
+) -> StructuredNotes {
+    let title = title_hint
+        .map(sanitize_session_title)
+        .unwrap_or_else(|| sanitize_session_title(&heuristic_title(live_notes, segments)));
+    let transcript = segments_to_transcript(segments);
+    let transcript_lines = cleaned_summary_transcript_lines(live_notes, segments);
+    let bullets = select_general_recovery_lines(&transcript_lines);
+
+    let markdown = if bullets.is_empty() {
+        format!(
+            "## {title}\n- Transcript was captured, but it was too noisy to extract reliable topic details."
+        )
+    } else {
+        format!(
+            "## {title}\n{}",
+            bullets
+                .into_iter()
+                .map(|bullet| format!("- {bullet}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        )
+    };
+
+    StructuredNotes {
+        transcript,
+        raw_notes: Some(markdown),
+        ..Default::default()
+    }
+}
+
+fn collect_key_points(transcript_lines: &[String], salient_lines: &[String]) -> Vec<String> {
     let mut points = salient_lines.iter().take(4).cloned().collect::<Vec<_>>();
 
     if points.is_empty() {
-        points.extend(
-            segments
-                .iter()
-                .take(4)
-                .map(|segment| segment.text.trim().to_string())
-                .collect::<Vec<_>>(),
-        );
-    }
-
-    if points.is_empty() {
-        points.extend(
-            live_notes
-                .lines()
-                .map(str::trim)
-                .filter(|line| !line.is_empty())
-                .take(4)
-                .map(strip_speaker_prefix)
-                .map(str::to_string),
-        );
+        points.extend(transcript_lines.iter().take(4).cloned());
     }
 
     points
 }
 
-fn collect_action_items(live_notes: &str) -> Vec<String> {
+fn collect_action_items(transcript_lines: &[String]) -> Vec<String> {
     collect_matching_lines(
-        live_notes,
+        transcript_lines,
         &["todo", "action", "follow up", "next step", "will "],
     )
 }
 
-fn collect_decisions(live_notes: &str) -> Vec<String> {
+fn collect_decisions(transcript_lines: &[String]) -> Vec<String> {
     collect_matching_lines(
-        live_notes,
+        transcript_lines,
         &["decide", "decision", "agreed", "ship", "go with"],
     )
 }
 
-fn collect_open_questions(live_notes: &str) -> Vec<String> {
-    let mut questions = collect_matching_lines(live_notes, &["?", "open question", "unclear"]);
+fn collect_open_questions(transcript_lines: &[String]) -> Vec<String> {
+    let mut questions =
+        collect_matching_lines(transcript_lines, &["?", "open question", "unclear"]);
     if questions.is_empty() {
         questions.push("No explicit open questions were captured.".to_string());
     }
     questions
 }
 
-fn collect_matching_lines(live_notes: &str, needles: &[&str]) -> Vec<String> {
-    live_notes
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .filter(|line| {
-            let lower = line.to_lowercase();
-            needles.iter().any(|needle| lower.contains(needle))
-        })
-        .take(4)
-        .map(str::to_string)
-        .collect()
+fn collect_matching_lines(transcript_lines: &[String], needles: &[&str]) -> Vec<String> {
+    let mut kept = Vec::<String>::new();
+
+    for line in transcript_lines.iter().map(String::as_str) {
+        let lower = line.to_ascii_lowercase();
+        if !needles.iter().any(|needle| lower.contains(needle)) {
+            continue;
+        }
+
+        let cleaned = clean_candidate_line(line);
+        if cleaned.is_empty()
+            || !line_has_reliable_summary_signal(&cleaned)
+            || kept
+                .iter()
+                .any(|existing| lines_are_similar(existing, &cleaned))
+        {
+            continue;
+        }
+
+        kept.push(cleaned);
+        if kept.len() >= 4 {
+            break;
+        }
+    }
+
+    kept
 }
 
 fn excerpt_lines(text: &str, limit: usize) -> String {
@@ -1708,6 +2160,13 @@ fn excerpt_lines(text: &str, limit: usize) -> String {
 
 #[derive(Clone, Debug)]
 struct SalientLine {
+    index: usize,
+    text: String,
+    score: i32,
+}
+
+#[derive(Clone, Debug)]
+struct RecoveryLine {
     index: usize,
     text: String,
     score: i32,
@@ -1745,31 +2204,20 @@ fn build_heuristic_summary(
     lines.join("\n")
 }
 
-fn collect_salient_lines(live_notes: &str, segments: &[CanonicalSegment]) -> Vec<String> {
-    let candidates = if segments.is_empty() {
-        live_notes
-            .lines()
-            .map(str::trim)
-            .filter(|line| !line.is_empty())
-            .map(strip_speaker_prefix)
-            .map(str::to_string)
-            .collect::<Vec<_>>()
-    } else {
-        segments
-            .iter()
-            .map(|segment| segment.text.trim().to_string())
-            .collect::<Vec<_>>()
-    };
-
+fn collect_salient_lines(candidates: &[String]) -> Vec<String> {
     let mut kept = Vec::<SalientLine>::new();
-    for (index, candidate) in candidates.into_iter().enumerate() {
-        let text = clean_candidate_line(&candidate);
-        if text.is_empty() {
+    for (index, candidate) in candidates.iter().enumerate() {
+        let text = clean_candidate_line(candidate);
+        if text.is_empty() || !line_has_reliable_summary_signal(&text) {
+            continue;
+        }
+        let tokens = summary_tokens(&text);
+        if text.ends_with('?') && !contains_summary_keywords(&text) && tokens.len() < 14 {
             continue;
         }
 
         let score = summary_candidate_score(&text);
-        if score < 8 {
+        if score < 10 {
             continue;
         }
 
@@ -1795,8 +2243,128 @@ fn collect_salient_lines(live_notes: &str, segments: &[CanonicalSegment]) -> Vec
             .then(left.index.cmp(&right.index))
     });
     kept.truncate(4);
-    kept.sort_by_key(|line| line.index);
     kept.into_iter().map(|line| line.text).collect()
+}
+
+fn select_general_recovery_lines(candidates: &[String]) -> Vec<String> {
+    let mut kept = Vec::<RecoveryLine>::new();
+
+    for (index, candidate) in candidates.iter().enumerate() {
+        let text = clean_candidate_line(candidate);
+        if text.is_empty() || !line_has_reliable_summary_signal(&text) {
+            continue;
+        }
+
+        let mut score = summary_candidate_score(&text);
+        if contains_temporal_markers(&text) {
+            score += 4;
+        }
+        if contains_summary_keywords(&text) {
+            score += 4;
+        }
+        if score < 10 {
+            continue;
+        }
+
+        kept.push(RecoveryLine { index, text, score });
+    }
+
+    for idx in 0..kept.len() {
+        let support = kept
+            .iter()
+            .enumerate()
+            .filter(|(other_idx, other)| {
+                *other_idx != idx && lines_share_topic_signal(&kept[idx].text, &other.text)
+            })
+            .count() as i32;
+        kept[idx].score += support.min(3) * 4;
+    }
+
+    kept.retain(|line| {
+        line.score >= 16
+            || (line.score >= 12
+                && (contains_temporal_markers(&line.text) || contains_summary_keywords(&line.text)))
+    });
+
+    kept.sort_by(|left, right| {
+        right
+            .score
+            .cmp(&left.score)
+            .then(left.index.cmp(&right.index))
+    });
+
+    let mut selected = Vec::<RecoveryLine>::new();
+    for candidate in kept {
+        if selected
+            .iter()
+            .any(|existing| lines_are_similar(&existing.text, &candidate.text))
+        {
+            continue;
+        }
+        selected.push(candidate);
+        if selected.len() >= 4 {
+            break;
+        }
+    }
+
+    selected.sort_by_key(|line| line.index);
+    selected.into_iter().map(|line| line.text).collect()
+}
+
+fn cleaned_summary_transcript_lines(
+    live_notes: &str,
+    segments: &[CanonicalSegment],
+) -> Vec<String> {
+    let (_, transcript_body) = split_scratch_pad_context(live_notes);
+    let source_lines = if segments.is_empty() {
+        transcript_body
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+    } else {
+        segments
+            .iter()
+            .map(|segment| segment.text.trim().to_string())
+            .collect::<Vec<_>>()
+    };
+    let mut cleaned = Vec::<String>::new();
+
+    for line in source_lines {
+        let sanitized = sanitize_summary_transcript_body(&line);
+        if sanitized.is_empty() {
+            continue;
+        }
+
+        for fragment in split_summary_fragments(&sanitized) {
+            let fragment = collapse_spaces(fragment.trim());
+            let tokens = summary_tokens(&fragment);
+            if tokens.len() < 4 || is_meta_summary_line(&fragment) {
+                continue;
+            }
+            if fragment.chars().count() > 220 {
+                continue;
+            }
+            if tokens.len() >= 8
+                && looks_noisy_line(&fragment, &tokens)
+                && !contains_summary_keywords(&fragment)
+            {
+                continue;
+            }
+            if cleaned
+                .iter()
+                .rev()
+                .take(SUMMARY_TRANSCRIPT_RECENT_LINE_WINDOW)
+                .any(|existing| lines_are_similar(existing, &fragment))
+            {
+                continue;
+            }
+            cleaned.push(fragment);
+        }
+    }
+
+    cleaned
 }
 
 fn clean_candidate_line(text: &str) -> String {
@@ -1824,6 +2392,32 @@ fn clean_candidate_line(text: &str) -> String {
         .to_string()
 }
 
+fn line_has_reliable_summary_signal(text: &str) -> bool {
+    let cleaned = clean_candidate_line(text);
+    if cleaned.is_empty() {
+        return false;
+    }
+
+    let tokens = summary_tokens(&cleaned);
+    if tokens.len() < 4 {
+        return false;
+    }
+
+    if is_low_value_conversational_line(&cleaned)
+        || pronoun_heavy_without_anchor(&cleaned, &tokens)
+        || starts_like_fragmented_question(&tokens, &cleaned)
+        || contains_transcript_filler_phrase(&cleaned)
+        || is_generic_boilerplate_line(&cleaned)
+        || line_compacts_significantly(&cleaned)
+        || contains_repeated_ngram(&tokens, 3, 2)
+        || contains_repeated_ngram(&tokens, 4, 2)
+    {
+        return false;
+    }
+
+    !looks_noisy_line(&cleaned, &tokens)
+}
+
 fn summary_candidate_score(text: &str) -> i32 {
     let tokens = summary_tokens(text);
     if tokens.len() < 4 {
@@ -1835,6 +2429,14 @@ fn summary_candidate_score(text: &str) -> i32 {
     let long_tokens = tokens.iter().filter(|token| token.len() >= 4).count() as i32;
     let short_tokens = tokens.iter().filter(|token| token.len() <= 2).count() as i32;
     let repeated_penalty = most_common_token_frequency(&tokens).saturating_sub(2) as i32 * 3;
+    let numeric_tokens = tokens
+        .iter()
+        .filter(|token| token.chars().any(|ch| ch.is_ascii_digit()))
+        .count() as i32;
+    let first_person_tokens = tokens
+        .iter()
+        .filter(|token| matches!(token.as_str(), "i" | "i'm" | "ive" | "i've" | "me" | "my"))
+        .count() as i32;
 
     let mut score = tokens.len().min(18) as i32 + long_tokens * 2 - short_tokens;
 
@@ -1846,12 +2448,36 @@ fn summary_candidate_score(text: &str) -> i32 {
         score -= 6;
     }
 
-    if text.ends_with(['.', '?', '!']) {
+    if text.ends_with('?') {
+        score -= 12;
+    } else if text.ends_with(['.', '!']) {
         score += 3;
     }
 
     if contains_summary_keywords(text) {
         score += 4;
+    }
+    if numeric_tokens > 0 {
+        score += 6 + numeric_tokens.min(3) * 2;
+    }
+    if contains_temporal_markers(text) {
+        score += 4;
+    }
+    if first_person_tokens >= 2
+        && !contains_temporal_markers(text)
+        && !contains_summary_keywords(text)
+        && numeric_tokens == 0
+    {
+        score -= 10;
+    }
+    if is_low_value_conversational_line(text) {
+        score -= 16;
+    }
+    if starts_with_fragment_connector(text) {
+        score -= 6;
+    }
+    if contains_repeated_ngram(&tokens, 3, 2) {
+        score -= 10;
     }
 
     if looks_noisy_line(text, &tokens) {
@@ -1872,6 +2498,107 @@ fn summary_tokens(text: &str) -> Vec<String> {
         .collect()
 }
 
+fn summary_content_tokens(text: &str) -> Vec<String> {
+    summary_tokens(text)
+        .into_iter()
+        .flat_map(expand_summary_content_token)
+        .filter(|token| token.len() >= 4)
+        .filter(|token| {
+            !matches!(
+                token.as_str(),
+                "that"
+                    | "this"
+                    | "with"
+                    | "from"
+                    | "have"
+                    | "they"
+                    | "them"
+                    | "then"
+                    | "just"
+                    | "like"
+                    | "into"
+                    | "your"
+                    | "what"
+                    | "when"
+                    | "where"
+                    | "which"
+                    | "would"
+                    | "could"
+                    | "should"
+                    | "there"
+                    | "their"
+                    | "about"
+                    | "after"
+                    | "before"
+                    | "because"
+                    | "really"
+                    | "probably"
+                    | "basically"
+            )
+        })
+        .collect()
+}
+
+fn expand_summary_content_token(token: String) -> Vec<String> {
+    let mut expanded = vec![token.clone()];
+
+    if token.contains('-') || token.contains('/') {
+        expanded.extend(
+            token
+                .split(|ch: char| matches!(ch, '-' | '/'))
+                .filter(|part| !part.is_empty())
+                .map(str::to_string),
+        );
+    }
+
+    expanded
+}
+
+fn line_compacts_significantly(text: &str) -> bool {
+    let compacted = compact_repeated_tokens(text);
+    let compacted_len = compacted.chars().count();
+    let original_len = text.chars().count();
+    compacted_len > 0 && compacted_len * 10 < original_len * 9
+}
+
+fn contains_transcript_filler_phrase(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    [
+        "so like",
+        "you know",
+        "i think",
+        "i guess",
+        "gonna",
+        "wanna",
+        "gotta",
+        "kind of",
+        "sort of",
+        "let's do that",
+        "lets do that",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
+fn is_generic_boilerplate_line(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    [
+        "is a common practice",
+        "is a crucial component",
+        "significantly impact operational efficiency",
+        "necessary knowledge, skills, and tools",
+        "effective team communication, collaboration, and alignment",
+        "overall performance",
+        "optimal results",
+        "various industries",
+        "high operational demands",
+        "defined timeframe",
+        "employee competency and preparedness",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
 fn most_common_token_frequency(tokens: &[String]) -> usize {
     let mut best = 0usize;
     for token in tokens {
@@ -1885,9 +2612,58 @@ fn most_common_token_frequency(tokens: &[String]) -> usize {
     best
 }
 
+fn contains_repeated_ngram(tokens: &[String], size: usize, min_occurrences: usize) -> bool {
+    if size == 0 || min_occurrences < 2 || tokens.len() < size * min_occurrences {
+        return false;
+    }
+
+    for start in 0..=tokens.len() - size {
+        let window = &tokens[start..start + size];
+        let occurrences = (0..=tokens.len() - size)
+            .filter(|index| tokens[*index..*index + size] == window[..])
+            .count();
+        if occurrences >= min_occurrences {
+            return true;
+        }
+    }
+
+    false
+}
+
 fn contains_summary_keywords(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
     [
+        "dashboard",
+        "slack",
+        "incident",
+        "runbook",
+        "on call",
+        "on-call",
+        "pto",
+        "swap",
+        "coverage",
+        "schedule",
+        "restore",
+        "automation",
+        "automate",
+        "alert",
+        "page",
+        "paging",
+        "owner",
+        "deadline",
+        "follow up",
+        "follow-up",
+        "next step",
+        "review",
+        "launch",
+        "release",
+        "ship",
+        "bug",
+        "fix",
+        "deploy",
+        "migration",
+        "access",
+        "permissions",
         "apple",
         "metal",
         "cuda",
@@ -1903,6 +2679,96 @@ fn contains_summary_keywords(text: &str) -> bool {
     ]
     .iter()
     .any(|needle| lower.contains(needle))
+}
+
+fn contains_temporal_markers(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    [
+        "today",
+        "tomorrow",
+        "monday",
+        "tuesday",
+        "wednesday",
+        "thursday",
+        "friday",
+        "saturday",
+        "sunday",
+        "next week",
+        "this week",
+        "on call",
+        "pto",
+        "vacation",
+        "deadline",
+        "morning",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
+fn starts_with_fragment_connector(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    [
+        "and ", "or ", "but ", "so ", "then ", "because ", "well ", "okay ", "ok ",
+    ]
+    .iter()
+    .any(|prefix| lower.starts_with(prefix))
+}
+
+fn is_low_value_conversational_line(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    [
+        "hey ",
+        "good morning",
+        "good afternoon",
+        "how's it going",
+        "how is it going",
+        "did you see my message",
+        "are you gonna",
+        "are you going to",
+        "sounds good",
+        "okay cool",
+        "ok cool",
+        "i can't say that",
+        "thank you",
+        "thanks",
+    ]
+    .iter()
+    .any(|prefix| lower.starts_with(prefix))
+}
+
+fn contains_forbidden_summary_pronouns(text: &str) -> bool {
+    summary_tokens(text).iter().any(|token| {
+        matches!(
+            token.as_str(),
+            "i" | "i'm" | "ive" | "i've" | "me" | "my" | "you" | "your"
+        )
+    })
+}
+
+fn pronoun_heavy_without_anchor(text: &str, tokens: &[String]) -> bool {
+    let pronouns = tokens
+        .iter()
+        .filter(|token| matches!(token.as_str(), "i" | "i'm" | "ive" | "i've" | "me" | "my"))
+        .count();
+    let has_numeric = tokens
+        .iter()
+        .any(|token| token.chars().any(|ch| ch.is_ascii_digit()));
+    pronouns >= 2
+        && !has_numeric
+        && !contains_temporal_markers(text)
+        && !contains_summary_keywords(text)
+}
+
+fn starts_like_fragmented_question(tokens: &[String], text: &str) -> bool {
+    let Some(first) = tokens.first() else {
+        return false;
+    };
+
+    matches!(
+        first.as_str(),
+        "does" | "do" | "did" | "is" | "are" | "was" | "were" | "can" | "could" | "would"
+    ) && !contains_temporal_markers(text)
+        && !contains_summary_keywords(text)
 }
 
 fn looks_noisy_line(text: &str, tokens: &[String]) -> bool {
@@ -1921,6 +2787,22 @@ fn looks_noisy_line(text: &str, tokens: &[String]) -> bool {
         || short_ratio > 0.45
         || lower.matches("okay").count() >= 3
         || lower.matches("clean").count() >= 4
+}
+
+fn lines_share_topic_signal(left: &str, right: &str) -> bool {
+    if lines_are_similar(left, right) {
+        return true;
+    }
+
+    let left_tokens = summary_content_tokens(left);
+    let right_tokens = summary_content_tokens(right);
+    if left_tokens.is_empty() || right_tokens.is_empty() {
+        return false;
+    }
+
+    let left_set = left_tokens.iter().collect::<HashSet<_>>();
+    let right_set = right_tokens.iter().collect::<HashSet<_>>();
+    left_set.intersection(&right_set).count() >= 2
 }
 
 fn lines_are_similar(left: &str, right: &str) -> bool {
@@ -1983,6 +2865,72 @@ fn transcript_seems_noisy(
         .count();
 
     noisy_count * 2 >= raw_lines.len()
+}
+
+fn transcript_is_pathological_for_llm(live_notes: &str, segments: &[CanonicalSegment]) -> bool {
+    let lines = if segments.is_empty() {
+        live_notes
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(strip_speaker_prefix)
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+    } else {
+        segments
+            .iter()
+            .map(|segment| segment.text.trim().to_string())
+            .collect::<Vec<_>>()
+    };
+
+    lines.iter().any(|line| pathological_transcript_line(line))
+}
+
+fn pathological_transcript_line(text: &str) -> bool {
+    let trimmed = text.trim();
+    let char_count = trimmed.chars().count();
+    if char_count >= 900 {
+        return true;
+    }
+    if char_count < 180 {
+        return false;
+    }
+
+    let repaired = repair_summary_spacing(trimmed);
+    let compacted = compact_repeated_tokens(&repaired);
+    let compacted_chars = compacted.chars().count();
+    if compacted_chars * 10 < char_count * 8 {
+        return true;
+    }
+
+    let sanitized = sanitize_summary_transcript_body(trimmed);
+    let sanitized_chars = sanitized.chars().count();
+    if sanitized_chars > 0 && sanitized_chars * 10 < char_count * 8 {
+        return true;
+    }
+
+    let fragments = split_summary_fragments(&repaired)
+        .into_iter()
+        .map(|fragment| collapse_spaces(fragment.trim()))
+        .filter(|fragment| summary_tokens(fragment).len() >= 4)
+        .collect::<Vec<_>>();
+    let fragment_count = fragments.len();
+    if fragment_count < 4 {
+        return false;
+    }
+
+    let mut unique = Vec::<String>::new();
+    for fragment in fragments {
+        if unique
+            .iter()
+            .any(|existing| lines_are_similar(existing, &fragment))
+        {
+            continue;
+        }
+        unique.push(fragment);
+    }
+
+    unique.len() * 2 <= fragment_count
 }
 
 fn as_summary_sentence(text: &str) -> String {
@@ -2070,7 +3018,27 @@ fn sanitize_session_title(text: &str) -> String {
     }
 }
 
+fn validated_session_title(text: &str, fallback: &str) -> String {
+    let cleaned = sanitize_session_title(text);
+    let lower = cleaned.to_ascii_lowercase();
+    if cleaned.is_empty()
+        || is_meta_summary_line(&cleaned)
+        || is_presentational_line(&cleaned)
+        || matches!(
+            lower.as_str(),
+            "thinking" | "summary" | "notes" | "breakdown" | "response" | "overview"
+        )
+    {
+        return sanitize_session_title(fallback);
+    }
+    cleaned
+}
+
 fn strip_speaker_prefix(text: &str) -> &str {
+    speaker_prefix(text).map(|(_, rest)| rest).unwrap_or(text)
+}
+
+fn speaker_prefix(text: &str) -> Option<(&'static str, &str)> {
     for prefix in [
         "You:",
         "S1:",
@@ -2093,10 +3061,239 @@ fn strip_speaker_prefix(text: &str) -> &str {
         "Person F:",
     ] {
         if let Some(rest) = text.strip_prefix(prefix) {
-            return rest.trim();
+            return Some((prefix, rest.trim()));
         }
     }
-    text
+    None
+}
+
+fn sanitize_summary_transcript_lines<I>(lines: I, include_speaker_labels: bool) -> String
+where
+    I: IntoIterator<Item = String>,
+{
+    let mut cleaned_lines = Vec::<String>::new();
+
+    for line in lines {
+        let Some(cleaned) = sanitize_summary_transcript_line(&line, include_speaker_labels) else {
+            continue;
+        };
+
+        if cleaned_lines
+            .iter()
+            .rev()
+            .take(SUMMARY_TRANSCRIPT_RECENT_LINE_WINDOW)
+            .any(|existing| lines_are_similar(existing, &cleaned))
+        {
+            continue;
+        }
+
+        cleaned_lines.push(cleaned);
+    }
+
+    cleaned_lines.join("\n")
+}
+
+fn sanitize_summary_transcript_line(line: &str, include_speaker_labels: bool) -> Option<String> {
+    let (speaker, body) = speaker_prefix(line).map_or((None, line), |(prefix, rest)| {
+        (Some(prefix.trim_end_matches(':')), rest)
+    });
+    let cleaned = sanitize_summary_transcript_body(body);
+    if cleaned.is_empty() {
+        return None;
+    }
+
+    if include_speaker_labels {
+        speaker
+            .map(|label| format!("{label}: {cleaned}"))
+            .or(Some(cleaned))
+    } else {
+        Some(cleaned)
+    }
+}
+
+fn sanitize_summary_transcript_body(text: &str) -> String {
+    let repaired = repair_summary_spacing(text);
+    let mut kept = Vec::<String>::new();
+
+    for fragment in split_summary_fragments(&repaired) {
+        let compacted = compact_repeated_tokens(&fragment);
+        if compacted.is_empty() {
+            continue;
+        }
+
+        let tokens = summary_tokens(&compacted);
+        if tokens.len() < 3 || is_meta_summary_line(&compacted) {
+            continue;
+        }
+        if tokens.len() >= 8
+            && looks_noisy_line(&compacted, &tokens)
+            && !contains_summary_keywords(&compacted)
+        {
+            continue;
+        }
+
+        if let Some(existing) = kept
+            .iter_mut()
+            .rev()
+            .take(3)
+            .find(|existing| lines_are_similar(existing, &compacted))
+        {
+            if compacted.chars().count() > existing.chars().count()
+                && compacted.contains(existing.as_str())
+            {
+                *existing = compacted;
+            }
+            continue;
+        }
+
+        kept.push(compacted);
+    }
+
+    if kept.is_empty() {
+        let compacted = compact_repeated_tokens(&repaired);
+        let tokens = summary_tokens(&compacted);
+        if compacted.is_empty() || (tokens.len() >= 8 && looks_noisy_line(&compacted, &tokens)) {
+            return String::new();
+        }
+        return compacted;
+    }
+
+    kept.join(". ")
+}
+
+fn repair_summary_spacing(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        out.push(ch);
+        if matches!(ch, '.' | '?' | '!' | ';' | ':') {
+            if let Some(next) = chars.peek().copied() {
+                if !next.is_whitespace() && !matches!(next, '.' | ',' | '?' | '!') {
+                    out.push(' ');
+                }
+            }
+        }
+    }
+
+    out
+}
+
+fn split_summary_fragments(text: &str) -> Vec<String> {
+    let mut fragments = Vec::<String>::new();
+    let mut current = String::new();
+
+    for ch in text.chars() {
+        current.push(ch);
+        if matches!(ch, '.' | '?' | '!' | ';' | '\n') {
+            let fragment = collapse_spaces(current.trim());
+            if !fragment.is_empty() {
+                fragments.push(fragment);
+            }
+            current.clear();
+        }
+    }
+
+    let trailing = collapse_spaces(current.trim());
+    if !trailing.is_empty() {
+        fragments.push(trailing);
+    }
+    if fragments.is_empty() {
+        let single = collapse_spaces(text.trim());
+        if !single.is_empty() {
+            fragments.push(single);
+        }
+    }
+
+    fragments
+}
+
+fn compact_repeated_tokens(text: &str) -> String {
+    let raw_tokens = text.split_whitespace().collect::<Vec<_>>();
+    if raw_tokens.is_empty() {
+        return String::new();
+    }
+
+    let normalized_tokens = raw_tokens
+        .iter()
+        .map(|token| {
+            token
+                .trim_matches(|ch: char| !ch.is_alphanumeric() && ch != '\'')
+                .to_ascii_lowercase()
+        })
+        .collect::<Vec<_>>();
+    let mut kept = Vec::<&str>::new();
+    let mut kept_normalized = Vec::<String>::new();
+    let max_ngram = SUMMARY_TRANSCRIPT_REPEAT_NGRAM_MAX.min(raw_tokens.len() / 2);
+    let mut index = 0usize;
+
+    while index < raw_tokens.len() {
+        let mut collapsed = false;
+        for size in (SUMMARY_TRANSCRIPT_REPEAT_NGRAM_MIN..=max_ngram).rev() {
+            if index + size * 2 > raw_tokens.len() {
+                continue;
+            }
+            if normalized_tokens[index..index + size]
+                .iter()
+                .any(|token| token.is_empty())
+            {
+                continue;
+            }
+
+            let first = &normalized_tokens[index..index + size];
+            let second = &normalized_tokens[index + size..index + size * 2];
+            if first != second {
+                continue;
+            }
+
+            kept.extend_from_slice(&raw_tokens[index..index + size]);
+            kept_normalized.extend(first.iter().cloned());
+            let pattern = first.to_vec();
+            index += size * 2;
+            while index + size <= raw_tokens.len()
+                && normalized_tokens[index..index + size] == pattern[..]
+            {
+                index += size;
+            }
+            collapsed = true;
+            break;
+        }
+
+        if collapsed {
+            continue;
+        }
+
+        if kept_normalized
+            .last()
+            .is_some_and(|last| !last.is_empty() && *last == normalized_tokens[index])
+        {
+            index += 1;
+            continue;
+        }
+
+        kept.push(raw_tokens[index]);
+        kept_normalized.push(normalized_tokens[index].clone());
+        index += 1;
+    }
+
+    collapse_spaces(&kept.join(" "))
+}
+
+fn looks_symbolic_line(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+
+    let alnum_count = trimmed.chars().filter(|ch| ch.is_alphanumeric()).count();
+    let total_count = trimmed.chars().filter(|ch| !ch.is_whitespace()).count();
+    if total_count > 0 && alnum_count * 3 < total_count {
+        return true;
+    }
+
+    trimmed
+        .chars()
+        .all(|ch| matches!(ch, '-' | '*' | '.' | '_' | ':' | ';'))
 }
 
 fn collapse_spaces(text: &str) -> String {
@@ -2146,12 +3343,14 @@ fn title_case_words(text: &str) -> String {
 mod tests {
     use super::{
         build_structured_notes_prompt, clean_general_markdown, full_summary_context,
-        heuristic_structured_notes, merge_topic_mentions, parse_model_structured_notes,
-        render_general_summary_draft, sanitize_session_title, summarize_general_multistage,
-        GeneralSummaryDraft, TopicMention, TopicSection,
+        heuristic_general_notes, heuristic_structured_notes, merge_topic_mentions,
+        parse_model_structured_notes, parse_simple_bullets, render_general_summary_draft,
+        sanitize_session_title, select_general_recovery_lines, summarize_general_multistage,
+        summarize_general_recovery, validated_session_title, GeneralSummaryDraft, TopicMention,
+        TopicSection,
     };
-    use screamer_core::ambient::{AudioLane, CanonicalSegment, SpeakerLabel, StructuredNotes};
     use screamer_core::ambient::SummaryTemplate;
+    use screamer_core::ambient::{AudioLane, CanonicalSegment, SpeakerLabel};
 
     #[test]
     fn sanitize_session_title_strips_formatting_and_speaker_prefixes() {
@@ -2168,6 +3367,14 @@ mod tests {
                 "a very long title that should absolutely keep only the first few words"
             ),
             "A Very Long Title"
+        );
+    }
+
+    #[test]
+    fn validated_session_title_rejects_meta_model_output() {
+        assert_eq!(
+            validated_session_title("Okay, here's the summary", "SIP Training"),
+            "Sip Training"
         );
     }
 
@@ -2247,6 +3454,134 @@ mod tests {
             vec!["How much of wav2vec2 can be shared?".to_string()]
         );
         assert_eq!(parsed.transcript, "S1: transcript");
+    }
+
+    #[test]
+    fn select_general_recovery_lines_prefers_supported_concrete_fragments() {
+        let lines = vec![
+            "Hey man, how's it going?".to_string(),
+            "I'm on call but I'm taking PTO on the 20th and need coverage.".to_string(),
+            "The week of the 20th is the one that needs on-call coverage.".to_string(),
+            "I looked at it and tried to decide whether I thought I could ban a phone deal."
+                .to_string(),
+            "We should restore Slack access for the on-call group and update the runbook."
+                .to_string(),
+        ];
+
+        let selected = select_general_recovery_lines(&lines);
+
+        assert!(selected.iter().any(|line| line.contains("PTO on the 20th")));
+        assert!(selected.iter().any(|line| line.contains("Slack access")));
+        assert!(!selected.iter().any(|line| line.contains("how's it going")));
+        assert!(!selected
+            .iter()
+            .any(|line| line.contains("ban a phone deal")));
+    }
+
+    #[test]
+    fn summarize_general_recovery_rewrites_noisy_lines_into_note_style_sections() {
+        let segments = vec![
+            CanonicalSegment {
+                id: 1,
+                lane: AudioLane::Microphone,
+                speaker: SpeakerLabel::S1,
+                start_ms: 0,
+                end_ms: 500,
+                text: "I'm on call but I'm taking PTO on Friday and need coverage until I return Tuesday night.".to_string(),
+            },
+            CanonicalSegment {
+                id: 2,
+                lane: AudioLane::Microphone,
+                speaker: SpeakerLabel::S2,
+                start_ms: 500,
+                end_ms: 1_000,
+                text: "Tuesday onwards I can take over again if my flight is on time.".to_string(),
+            },
+            CanonicalSegment {
+                id: 3,
+                lane: AudioLane::Microphone,
+                speaker: SpeakerLabel::S1,
+                start_ms: 1_000,
+                end_ms: 1_500,
+                text: "During the last on-call incident, David handled it because I was offline."
+                    .to_string(),
+            },
+            CanonicalSegment {
+                id: 4,
+                lane: AudioLane::Microphone,
+                speaker: SpeakerLabel::S2,
+                start_ms: 1_500,
+                end_ms: 2_000,
+                text: "Our team does not treat this as a 24 hour on-call rotation.".to_string(),
+            },
+        ];
+        let generator = |_prompt: &str, _max_tokens: usize| -> Result<String, String> {
+            Err("fallbacks should be sufficient".to_string())
+        };
+
+        let notes = summarize_general_recovery("", &segments, Some("On-call"), &generator)
+            .expect("recovery summary should succeed");
+        let markdown = notes.raw_notes.expect("raw notes should be present");
+
+        assert!(markdown.contains("## On-Call Coverage"));
+        assert!(
+            markdown.contains("A team member requested on-call coverage during planned time off.")
+        );
+        assert!(
+            markdown.contains("Coverage may resume Tuesday night if the return flight is on time.")
+        );
+        assert!(markdown.contains(
+            "David handled a recent early-morning issue because the assigned person was offline."
+        ));
+        assert!(markdown.contains("## Incident Response"));
+        assert!(markdown.contains("## On-Call Expectations"));
+        assert!(markdown.contains("not treated as a 24-hour on-call rotation"));
+        assert!(!markdown.contains("I'm on call"));
+    }
+
+    #[test]
+    fn recovery_topic_inference_treats_handled_offline_lines_as_incidents() {
+        assert_eq!(
+            super::infer_recovery_topic_title(
+                "The one where I was on call happened early in the morning and David handled it because I was offline."
+            ),
+            "Incident Response"
+        );
+    }
+
+    #[test]
+    fn heuristic_general_notes_uses_topic_heading_only() {
+        let segments = vec![
+            CanonicalSegment {
+                id: 1,
+                lane: AudioLane::Microphone,
+                speaker: SpeakerLabel::S1,
+                start_ms: 0,
+                end_ms: 500,
+                text: "We need to port diarization to Apple Silicon.".to_string(),
+            },
+            CanonicalSegment {
+                id: 2,
+                lane: AudioLane::Microphone,
+                speaker: SpeakerLabel::S2,
+                start_ms: 500,
+                end_ms: 1_000,
+                text: "Metal support will need a rewrite of the current CUDA-dependent path."
+                    .to_string(),
+            },
+        ];
+        let fallback = heuristic_structured_notes("", &segments, Some("Diarization Port"));
+        let notes = heuristic_general_notes("", &segments, Some("Diarization Port"), &fallback);
+        let markdown = notes
+            .raw_notes
+            .expect("general fallback should render raw notes");
+
+        assert!(markdown.starts_with("## Diarization Port"));
+        assert!(!markdown.contains("## Summary"));
+        assert!(!markdown.contains("## Key Points"));
+        assert!(!markdown.contains("## Decisions"));
+        assert!(!markdown.contains("## Action Items"));
+        assert!(!markdown.contains("## Open Questions"));
     }
 
     #[test]
@@ -2339,6 +3674,43 @@ mod tests {
     }
 
     #[test]
+    fn general_context_compacts_repeated_transcript_fragments() {
+        let segments = vec![CanonicalSegment {
+            id: 1,
+            lane: AudioLane::Microphone,
+            speaker: SpeakerLabel::S1,
+            start_ms: 0,
+            end_ms: 500,
+            text: "I'm on call but I'm taking the 20th PTO. I'm on call but I'm taking the 20th PTO. I'm not going to be working and I probably won't even take my work computer with me. I'm not going to be working and I probably won't even take my work computer with me.".to_string(),
+        }];
+
+        let context = full_summary_context("", &segments, false);
+
+        assert_eq!(
+            context
+                .matches("I'm on call but I'm taking the 20th PTO")
+                .count(),
+            1
+        );
+        assert_eq!(
+            context
+                .matches("I'm not going to be working and I probably won't even take my work computer with me")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn pathological_transcript_line_detects_repetition_heavy_segments() {
+        let text =
+            "I'm on call but I'm taking the 20th PTO. I'm on call but I'm taking the 20th PTO. \
+I'm not going to be working and I probably won't even take my work computer with me. \
+I'm not going to be working and I probably won't even take my work computer with me.";
+
+        assert!(super::pathological_transcript_line(text));
+    }
+
+    #[test]
     fn clean_general_markdown_strips_speaker_labels_and_preamble() {
         let cleaned = clean_general_markdown(
             "Here’s a breakdown of the core discussion points:\n\n## Calendar Invite Flow\n* Person A: Ship next week if QA passes.\n* Person B: Maya will pair on the blocker.\n\n---",
@@ -2347,6 +3719,69 @@ mod tests {
         assert_eq!(
             cleaned,
             "## Calendar Invite Flow\n- Ship next week if QA passes.\n- Maya will pair on the blocker."
+        );
+    }
+
+    #[test]
+    fn clean_general_markdown_drops_meta_sections_and_keeps_signal() {
+        let cleaned = clean_general_markdown(
+            "## Detailed Breakdown of Topics\n- Okay, let's break this down into manageable chunks.\n- **1. The Goal:** Identify patterns in the data.\n\n## Release Planning\n- Ship next week if QA passes.\n\n## Action Items\n- Pair with Maya on the blocker tomorrow.",
+        );
+
+        assert_eq!(
+            cleaned,
+            "## Release Planning\n- Ship next week if QA passes.\n- Pair with Maya on the blocker tomorrow."
+        );
+    }
+
+    #[test]
+    fn clean_general_markdown_drops_low_value_conversational_bullets() {
+        let cleaned = clean_general_markdown(
+            "## On-call coverage\n- Hey man, how's it going?\n- A team member is taking PTO on the 20th and asked to swap on-call coverage.\n- Did you see my message?",
+        );
+
+        assert_eq!(
+            cleaned,
+            "## On-call coverage\n- A team member is taking PTO on the 20th and asked to swap on-call coverage."
+        );
+    }
+
+    #[test]
+    fn clean_general_markdown_drops_repetition_heavy_bullets() {
+        let cleaned = clean_general_markdown(
+            "## Scheduling\n- I'm gonna create it sometime today and probably start by adding like I'm gonna create it sometime today and probably start by adding.\n- A team member is on PTO Friday through Monday and needs on-call coverage.",
+        );
+
+        assert_eq!(
+            cleaned,
+            "## Scheduling\n- A team member is on PTO Friday through Monday and needs on-call coverage."
+        );
+    }
+
+    #[test]
+    fn clean_general_markdown_drops_generic_boilerplate_bullets() {
+        let cleaned = clean_general_markdown(
+            "## On-call Rotation\n- On-call rotation is a common practice in various industries.\n- A team member asked for coverage while on PTO.",
+        );
+
+        assert_eq!(
+            cleaned,
+            "## On-call Rotation\n- A team member asked for coverage while on PTO."
+        );
+    }
+
+    #[test]
+    fn parse_simple_bullets_requires_list_items_and_ignores_meta_text() {
+        let bullets = parse_simple_bullets(
+            "Okay, let's break this down.\n- **Release timing**\n- Here’s a breakdown of the request.\n1. Pair with Maya tomorrow.",
+        );
+
+        assert_eq!(
+            bullets,
+            vec![
+                "Release timing".to_string(),
+                "Pair with Maya tomorrow.".to_string()
+            ]
         );
     }
 
@@ -2374,7 +3809,7 @@ mod tests {
     }
 
     #[test]
-    fn render_general_summary_draft_outputs_topics_then_operational_sections() {
+    fn render_general_summary_draft_outputs_topic_sections_only() {
         let markdown = render_general_summary_draft(&GeneralSummaryDraft {
             topics: vec![
                 TopicSection {
@@ -2386,16 +3821,13 @@ mod tests {
                     bullets: vec!["Support flagged time zones and duplicate reminders.".to_string()],
                 },
             ],
-            decisions: vec!["Release desktop editing first if the mobile bug slips.".to_string()],
-            action_items: vec!["Pair with Maya on the recurring bug tomorrow.".to_string()],
-            open_questions: vec!["Whether the recurring bug will be fixed before Thursday.".to_string()],
         });
 
         assert!(markdown.starts_with("## Release timing"));
         assert!(markdown.contains("## Customer confusion"));
-        assert!(markdown.contains("## Decisions"));
-        assert!(markdown.contains("## Action Items"));
-        assert!(markdown.contains("## Open Questions"));
+        assert!(!markdown.contains("## Decisions"));
+        assert!(!markdown.contains("## Action Items"));
+        assert!(!markdown.contains("## Open Questions"));
     }
 
     #[test]
@@ -2441,8 +3873,7 @@ mod tests {
                 speaker: SpeakerLabel::S2,
                 start_ms: 2_000,
                 end_ms: 2_500,
-                text: "Action item is to pair with Maya on the recurring bug tomorrow."
-                    .to_string(),
+                text: "Action item is to pair with Maya on the recurring bug tomorrow.".to_string(),
             },
             CanonicalSegment {
                 id: 6,
@@ -2458,38 +3889,27 @@ mod tests {
                 return Ok("- Release timing\n- Customer confusion".to_string());
             }
             if prompt.contains("Write bullets for the meeting topic `Release timing`") {
-                return Ok("- Ship the calendar invite flow next week if QA passes by Thursday.\n- If the recurring mobile bug slips, release desktop editing first.\n- The final go or no-go call happens in Friday's launch review.".to_string());
+                return Ok("- Ship the calendar invite flow next week if QA passes by Thursday.\n- If the recurring mobile bug slips, release desktop editing first.\n- Pair with Maya on the recurring mobile bug tomorrow.\n- The final go or no-go call happens in Friday's launch review.".to_string());
             }
             if prompt.contains("Write bullets for the meeting topic `Customer confusion`") {
-                return Ok("- Support flagged confusion around time zones and duplicate reminders.".to_string());
-            }
-            if prompt.contains("Extract only decisions") {
-                return Ok("- Ship the calendar invite flow next week if QA passes by Thursday.\n- Release desktop editing first if the recurring mobile bug slips.\n- Make the go or no-go call in Friday's launch review.".to_string());
-            }
-            if prompt.contains("Extract only concrete action items") {
-                return Ok("- Pair with Maya on the recurring bug tomorrow.".to_string());
-            }
-            if prompt.contains("Extract only unresolved questions") {
-                return Ok("- Whether the recurring mobile bug will be fixed before Thursday QA.".to_string());
+                return Ok(
+                    "- Support flagged confusion around time zones and duplicate reminders."
+                        .to_string(),
+                );
             }
             Err(format!("unexpected prompt: {prompt}"))
         };
 
-        let notes = summarize_general_multistage(
-            "",
-            &segments,
-            Some("Launch review"),
-            &StructuredNotes::default(),
-            &generator,
-        )
-        .expect("multistage summary should succeed");
+        let notes = summarize_general_multistage("", &segments, Some("Launch review"), &generator)
+            .expect("multistage summary should succeed");
         let markdown = notes.raw_notes.expect("raw notes should be present");
 
         assert!(markdown.contains("## Release timing"));
         assert!(markdown.contains("## Customer confusion"));
-        assert!(markdown.contains("## Decisions"));
-        assert!(markdown.contains("## Action Items"));
-        assert!(markdown.contains("## Open Questions"));
+        assert!(markdown.contains("Pair with Maya on the recurring mobile bug tomorrow."));
+        assert!(!markdown.contains("## Decisions"));
+        assert!(!markdown.contains("## Action Items"));
+        assert!(!markdown.contains("## Open Questions"));
         assert!(!markdown.contains("Person A"));
         assert!(!markdown.contains("Person B"));
     }

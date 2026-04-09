@@ -1,7 +1,5 @@
 use crate::ambient_controller::AmbientController;
-use crate::config::{
-    AppAppearance, Config, SummaryBackendPreference, HOTKEYS, MODELS, POSITIONS,
-};
+use crate::config::{AppAppearance, Config, SummaryBackendPreference, HOTKEYS, MODELS, POSITIONS};
 use crate::diarization::default_diarization_engine;
 use crate::logging;
 use crate::main_window::MainWindow;
@@ -356,6 +354,11 @@ fn menu_handler_class() -> &'static AnyClass {
                 start_ambient_session_action as extern "C" fn(*mut AnyObject, Sel, *mut AnyObject),
             );
             builder.add_method(
+                sel!(openOrStartAmbientSession:),
+                open_or_start_ambient_session_action
+                    as extern "C" fn(*mut AnyObject, Sel, *mut AnyObject),
+            );
+            builder.add_method(
                 sel!(stopAmbientSession:),
                 stop_ambient_session_action as extern "C" fn(*mut AnyObject, Sel, *mut AnyObject),
             );
@@ -575,6 +578,14 @@ extern "C" fn start_ambient_session_action(
     start_ambient_session();
 }
 
+extern "C" fn open_or_start_ambient_session_action(
+    _this: *mut AnyObject,
+    _sel: Sel,
+    _sender: *mut AnyObject,
+) {
+    open_or_start_ambient_session();
+}
+
 extern "C" fn stop_ambient_session_action(
     _this: *mut AnyObject,
     _sel: Sel,
@@ -592,11 +603,7 @@ extern "C" fn set_summary_template_action(
     set_summary_template(index as usize);
 }
 
-extern "C" fn reprocess_session_action(
-    _this: *mut AnyObject,
-    _sel: Sel,
-    _sender: *mut AnyObject,
-) {
+extern "C" fn reprocess_session_action(_this: *mut AnyObject, _sel: Sel, _sender: *mut AnyObject) {
     reprocess_current_session();
 }
 
@@ -928,6 +935,23 @@ fn start_ambient_session() {
             }
         }
     }
+}
+
+fn open_or_start_ambient_session() {
+    let active_session_id = AMBIENT_CONTROLLER
+        .get()
+        .and_then(|controller| controller.active_snapshot().map(|snapshot| snapshot.id));
+
+    if let Some(session_id) = active_session_id {
+        MAIN_WINDOW.with(|cell| {
+            if let Some(window) = cell.borrow().as_ref() {
+                window.show_session(session_id);
+            }
+        });
+        return;
+    }
+
+    start_ambient_session();
 }
 
 fn stop_ambient_session() {
@@ -1402,8 +1426,7 @@ impl App {
         let session_vis = self.recording_session.clone();
         let vision_state_vis_press = self.vision_overlay_state.clone();
         let vision_state_vis_release = self.vision_overlay_state.clone();
-        let vision_screenshot: Arc<Mutex<Option<std::path::PathBuf>>> =
-            Arc::new(Mutex::new(None));
+        let vision_screenshot: Arc<Mutex<Option<std::path::PathBuf>>> = Arc::new(Mutex::new(None));
         let vision_screenshot_release = vision_screenshot.clone();
 
         hotkey.start_on_main_thread(
@@ -1770,10 +1793,8 @@ impl App {
                     .map(|vs| vs.clone())
                     .unwrap_or(crate::overlay::VisionOverlayState::Hidden);
 
-                let vision_active = !matches!(
-                    vision_state,
-                    crate::overlay::VisionOverlayState::Hidden
-                );
+                let vision_active =
+                    !matches!(vision_state, crate::overlay::VisionOverlayState::Hidden);
 
                 if let Ok(mut ov) = overlay.try_borrow_mut() {
                     if recording {
