@@ -1,0 +1,4 @@
+output_dir	/Users/suvamsh/Documents/code/screamer/tmp/replay-refresh-session-1-check
+id	old_title	new_title	old_chars	new_chars	old_meta_hits	new_meta_hits	title_changed	summary_changed	transcript_changed	status
+1	You: hospital we have	Ambient Session Notes	9803	846	0	0	true	true	true	ok
+summary	applied=0	unchanged=0	errors=0

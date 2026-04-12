@@ -641,7 +641,7 @@ fn push_section(out: &mut String, heading: &str, lines: &[String]) {
         return;
     }
 
-    if heading == "Summary" || heading == "Transcript" {
+    if heading == "Transcript" {
         for line in non_empty {
             out.push_str(line);
             out.push('\n');
@@ -652,7 +652,7 @@ fn push_section(out: &mut String, heading: &str, lines: &[String]) {
 
     for line in non_empty {
         out.push_str("- ");
-        out.push_str(line);
+        out.push_str(markdown_list_item_body(line).unwrap_or(line));
         out.push('\n');
     }
     out.push('\n');
@@ -927,7 +927,7 @@ mod tests {
     }
 
     #[test]
-    fn structured_notes_markdown_uses_prominent_sections_and_keeps_summary_plain() {
+    fn structured_notes_markdown_uses_prominent_titled_bullets() {
         let notes = StructuredNotes {
             summary: "The release stays on track for next week.".to_string(),
             key_points: vec![
@@ -943,7 +943,7 @@ mod tests {
 
         assert_eq!(
             notes.to_markdown(),
-            "# Summary\n\nThe release stays on track for next week.\n\n# Key Points\n\n- **Owner:** Maya\n- **Risk:** timezone confusion in reminders\n\n# Decisions\n\n- Ship if QA passes by Thursday.\n\n# Action Items\n\n- **Maya:** pair on the blocker tomorrow.\n\n# Open Questions\n\n- None"
+            "# Summary\n\n- The release stays on track for next week.\n\n# Key Points\n\n- **Owner:** Maya\n- **Risk:** timezone confusion in reminders\n\n# Decisions\n\n- Ship if QA passes by Thursday.\n\n# Action Items\n\n- **Maya:** pair on the blocker tomorrow.\n\n# Open Questions\n\n- None"
         );
     }
 }

@@ -20,6 +20,11 @@ const DEFAULT_SPEECH_SNAP_COLLAR_MS: u64 = 80;
 #[cfg_attr(not(feature = "ort-coreml"), allow(dead_code))]
 const DEFAULT_NEAREST_SPEECH_ATTACH_MS: u64 = 320;
 const DEFAULT_CLUSTERING_SIMILARITY_THRESHOLD: f32 = 0.90;
+const BUILTIN_VAD_FRAME_MS: u64 = 20;
+const BUILTIN_VAD_MIN_SPEECH_MS: u64 = 220;
+const BUILTIN_VAD_MIN_SILENCE_MS: u64 = 180;
+const BUILTIN_VAD_MIN_PEAK_RMS: f32 = 0.000_01;
+const BUILTIN_VAD_MIN_THRESHOLD_RMS: f32 = 0.001_5;
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct NativeFinalPassDiagnostics {
@@ -72,6 +77,8 @@ struct CandidateRegion {
     start_ms: u64,
     end_ms: u64,
     segment_indices: Vec<usize>,
+    starts_after_turn: bool,
+    ends_before_turn: bool,
     embedding: Option<RegionEmbedding>,
     cluster_id: Option<usize>,
 }
@@ -182,7 +189,7 @@ pub fn run_native_final_pass(
     let total_t0 = Instant::now();
     let mut asset_version = BUILTIN_ASSET_VERSION.to_string();
     let mut warning = None;
-    let mut runtime_backend = "builtin_mfcc_v1".to_string();
+    let mut runtime_backend = "builtin_vad_mfcc_v1".to_string();
     let mut clustering_similarity_threshold = DEFAULT_CLUSTERING_SIMILARITY_THRESHOLD;
 
     let maybe_assets = match AmbientDiarizationAssetSet::discover() {
@@ -296,6 +303,8 @@ pub fn run_native_final_pass(
 fn build_builtin_regions(request: &NativeFinalPassRequest<'_>) -> (Vec<CandidateRegion>, u64, u64) {
     let segmentation_t0 = Instant::now();
     let mut regions = build_candidate_regions(request.transcript_segments);
+    let speech_regions = build_builtin_speech_regions(request.samples, request.sample_rate_hz);
+    snap_regions_to_speech(&mut regions, &speech_regions);
     smooth_regions(&mut regions);
     let segmentation_ms = segmentation_t0.elapsed().as_millis() as u64;
 
@@ -315,10 +324,12 @@ fn build_builtin_regions(request: &NativeFinalPassRequest<'_>) -> (Vec<Candidate
 
 fn build_candidate_regions(transcript_segments: &[TranscriptSegment]) -> Vec<CandidateRegion> {
     let mut regions: Vec<CandidateRegion> = Vec::new();
+    let mut previous_turn_next = false;
 
     for (index, segment) in transcript_segments.iter().enumerate() {
         let text = segment.text.trim();
         if text.is_empty() {
+            previous_turn_next = segment.speaker_turn_next;
             continue;
         }
 
@@ -326,9 +337,12 @@ fn build_candidate_regions(transcript_segments: &[TranscriptSegment]) -> Vec<Can
             start_ms: segment.start_ms,
             end_ms: segment.end_ms.max(segment.start_ms + 1),
             segment_indices: vec![index],
+            starts_after_turn: previous_turn_next,
+            ends_before_turn: segment.speaker_turn_next,
             embedding: None,
             cluster_id: None,
         });
+        previous_turn_next = segment.speaker_turn_next;
     }
 
     regions
@@ -354,11 +368,17 @@ fn smooth_regions(regions: &mut Vec<CandidateRegion>) {
             .get(index + 1)
             .map(|next| next.start_ms.saturating_sub(regions[index].end_ms));
 
-        let attach_prev = prev_gap
-            .filter(|gap| *gap <= SHORT_REGION_ATTACH_GAP_MS)
-            .zip(index.checked_sub(1));
+        let attach_prev = prev_gap.and_then(|gap| {
+            let prev = index.checked_sub(1)?;
+            (!has_turn_boundary_between(&regions[prev], &regions[index])
+                && gap <= SHORT_REGION_ATTACH_GAP_MS)
+                .then_some((gap, prev))
+        });
         let attach_next = next_gap
-            .filter(|gap| *gap <= SHORT_REGION_ATTACH_GAP_MS)
+            .filter(|gap| {
+                !has_turn_boundary_between(&regions[index], &regions[index + 1])
+                    && *gap <= SHORT_REGION_ATTACH_GAP_MS
+            })
             .map(|gap| (gap, index + 1));
 
         match (attach_prev, attach_next) {
@@ -385,6 +405,7 @@ fn merge_region_into_previous(regions: &mut Vec<CandidateRegion>, prev: usize, c
         previous
             .segment_indices
             .extend(current_region.segment_indices);
+        previous.ends_before_turn = current_region.ends_before_turn;
     }
 }
 
@@ -395,7 +416,63 @@ fn merge_region_into_next(regions: &mut Vec<CandidateRegion>, current: usize, ne
         let mut segment_indices = current_region.segment_indices;
         segment_indices.extend(next_region.segment_indices.iter().copied());
         next_region.segment_indices = segment_indices;
+        next_region.starts_after_turn = current_region.starts_after_turn;
     }
+}
+
+fn has_turn_boundary_between(left: &CandidateRegion, right: &CandidateRegion) -> bool {
+    left.ends_before_turn || right.starts_after_turn
+}
+
+fn build_builtin_speech_regions(samples: &[f32], sample_rate_hz: usize) -> Vec<SpeechRegion> {
+    if samples.is_empty() || sample_rate_hz == 0 {
+        return Vec::new();
+    }
+
+    let frame_samples = ((sample_rate_hz as u64 * BUILTIN_VAD_FRAME_MS) / 1_000).max(1) as usize;
+    let mut rms_by_frame = samples
+        .chunks(frame_samples)
+        .map(|frame| {
+            let energy = frame
+                .iter()
+                .map(|sample| (*sample as f64) * (*sample as f64))
+                .sum::<f64>()
+                / frame.len().max(1) as f64;
+            energy.sqrt() as f32
+        })
+        .collect::<Vec<_>>();
+
+    let peak = rms_by_frame.iter().copied().fold(0.0f32, f32::max);
+    if peak < BUILTIN_VAD_MIN_PEAK_RMS {
+        return Vec::new();
+    }
+
+    let mut sorted = rms_by_frame.clone();
+    sorted.sort_by(|left, right| left.total_cmp(right));
+    let noise_floor = sorted
+        .get(sorted.len().saturating_sub(1) / 5)
+        .copied()
+        .unwrap_or(0.0);
+    let dynamic_threshold = (noise_floor * 2.5)
+        .max(peak * 0.12)
+        .max(BUILTIN_VAD_MIN_THRESHOLD_RMS)
+        .min(peak * 0.60);
+
+    for rms in &mut rms_by_frame {
+        *rms = if dynamic_threshold > 0.0 {
+            *rms / dynamic_threshold
+        } else {
+            0.0
+        };
+    }
+
+    build_speech_regions_from_scores(
+        &rms_by_frame,
+        BUILTIN_VAD_FRAME_MS,
+        1.0,
+        BUILTIN_VAD_MIN_SPEECH_MS,
+        BUILTIN_VAD_MIN_SILENCE_MS,
+    )
 }
 
 fn extract_builtin_region_embedding(
@@ -651,6 +728,7 @@ fn build_canonical_segments(
 ) -> Vec<CanonicalSegment> {
     let mut segments = Vec::new();
     let mut next_segment_id = 1u64;
+    let mut previous_turn_next = false;
 
     for (segment, speaker) in transcript_segments.iter().zip(labels.iter().copied()) {
         let candidate = CanonicalSegment {
@@ -663,11 +741,12 @@ fn build_canonical_segments(
         };
 
         let len_before = segments.len();
-        if merge_segment(&mut segments, candidate, segment.speaker_turn_next).is_some()
+        if merge_segment(&mut segments, candidate, previous_turn_next).is_some()
             && segments.len() > len_before
         {
             next_segment_id += 1;
         }
+        previous_turn_next = segment.speaker_turn_next;
     }
 
     segments
@@ -719,30 +798,25 @@ fn snap_regions_to_speech(regions: &mut [CandidateRegion], speech_regions: &[Spe
     }
 
     for region in regions {
-        if let Some(best_overlap_region) = speech_regions
+        let overlapping_speech = speech_regions
             .iter()
-            .filter_map(|speech| {
-                let overlap = overlap_ms(
+            .filter(|speech| {
+                overlap_ms(
                     region.start_ms,
                     region.end_ms,
                     speech.start_ms,
                     speech.end_ms,
-                );
-                (overlap > 0).then_some((overlap, speech))
+                ) > 0
             })
-            .max_by_key(|(overlap, speech)| (*overlap, std::cmp::Reverse(speech.start_ms)))
-            .map(|(_, speech)| speech)
-        {
-            region.start_ms = region.start_ms.max(
-                best_overlap_region
-                    .start_ms
-                    .saturating_sub(DEFAULT_SPEECH_SNAP_COLLAR_MS),
-            );
-            region.end_ms = region.end_ms.min(
-                best_overlap_region
-                    .end_ms
-                    .saturating_add(DEFAULT_SPEECH_SNAP_COLLAR_MS),
-            );
+            .collect::<Vec<_>>();
+
+        if let (Some(first), Some(last)) = (overlapping_speech.first(), overlapping_speech.last()) {
+            region.start_ms = region
+                .start_ms
+                .max(first.start_ms.saturating_sub(DEFAULT_SPEECH_SNAP_COLLAR_MS));
+            region.end_ms = region
+                .end_ms
+                .min(last.end_ms.saturating_add(DEFAULT_SPEECH_SNAP_COLLAR_MS));
         } else if let Some(nearest_speech) = speech_regions.iter().min_by_key(|speech| {
             let midpoint = (region.start_ms + region.end_ms) / 2;
             let speech_midpoint = (speech.start_ms + speech.end_ms) / 2;
@@ -1252,6 +1326,25 @@ mod tests {
         }
     }
 
+    fn turn_segment(start_ms: u64, end_ms: u64, text: &str) -> TranscriptSegment {
+        TranscriptSegment {
+            speaker_turn_next: true,
+            ..segment(start_ms, end_ms, text)
+        }
+    }
+
+    fn candidate_region(start_ms: u64, end_ms: u64, segment_index: usize) -> CandidateRegion {
+        CandidateRegion {
+            start_ms,
+            end_ms,
+            segment_indices: vec![segment_index],
+            starts_after_turn: false,
+            ends_before_turn: false,
+            embedding: None,
+            cluster_id: None,
+        }
+    }
+
     #[test]
     fn native_final_pass_assigns_consistent_labels_for_repeated_voice() {
         let voice_a = sine_wave(220.0, 0.8);
@@ -1309,33 +1402,65 @@ mod tests {
     #[test]
     fn smoothing_absorbs_short_regions_between_neighbors() {
         let mut regions = vec![
-            CandidateRegion {
-                start_ms: 0,
-                end_ms: 600,
-                segment_indices: vec![0],
-                embedding: None,
-                cluster_id: None,
-            },
-            CandidateRegion {
-                start_ms: 620,
-                end_ms: 760,
-                segment_indices: vec![1],
-                embedding: None,
-                cluster_id: None,
-            },
-            CandidateRegion {
-                start_ms: 770,
-                end_ms: 1_300,
-                segment_indices: vec![2],
-                embedding: None,
-                cluster_id: None,
-            },
+            candidate_region(0, 600, 0),
+            candidate_region(620, 760, 1),
+            candidate_region(770, 1_300, 2),
         ];
 
         smooth_regions(&mut regions);
 
         assert_eq!(regions.len(), 2);
         assert_eq!(regions[0].segment_indices, vec![0, 1]);
+    }
+
+    #[test]
+    fn smoothing_preserves_explicit_turn_boundaries() {
+        let mut regions = vec![
+            CandidateRegion {
+                ends_before_turn: true,
+                ..candidate_region(0, 600, 0)
+            },
+            CandidateRegion {
+                starts_after_turn: true,
+                ..candidate_region(620, 760, 1)
+            },
+            candidate_region(770, 1_300, 2),
+        ];
+
+        smooth_regions(&mut regions);
+
+        assert_eq!(regions.len(), 2);
+        assert_eq!(regions[0].segment_indices, vec![0]);
+        assert_eq!(regions[1].segment_indices, vec![1, 2]);
+    }
+
+    #[test]
+    fn canonical_segments_apply_turn_next_to_following_segment() {
+        let labels = vec![SpeakerLabel::S1, SpeakerLabel::S1];
+        let segments = build_canonical_segments(
+            &[
+                turn_segment(0, 500, "first thought"),
+                segment(520, 900, "second thought"),
+            ],
+            &labels,
+        );
+
+        assert_eq!(segments.len(), 2);
+        assert_eq!(segments[0].text, "first thought");
+        assert_eq!(segments[1].text, "second thought");
+    }
+
+    #[test]
+    fn builtin_vad_detects_two_energy_regions() {
+        let mut samples = sine_wave(220.0, 0.4);
+        samples.extend(vec![0.0; (SR as f32 * 0.3) as usize]);
+        samples.extend(sine_wave(220.0, 0.4));
+
+        let regions = build_builtin_speech_regions(&samples, SR);
+
+        assert_eq!(regions.len(), 2);
+        assert!(regions[0].end_ms <= 500);
+        assert!(regions[1].start_ms >= 600);
     }
 
     #[test]
@@ -1349,13 +1474,7 @@ mod tests {
 
     #[test]
     fn speech_regions_snap_transcript_boundaries() {
-        let mut regions = vec![CandidateRegion {
-            start_ms: 100,
-            end_ms: 420,
-            segment_indices: vec![0],
-            embedding: None,
-            cluster_id: None,
-        }];
+        let mut regions = vec![candidate_region(100, 420, 0)];
         let speech = vec![SpeechRegion {
             start_ms: 150,
             end_ms: 350,

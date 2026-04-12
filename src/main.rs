@@ -20,6 +20,7 @@ mod screenshot;
 mod session_store;
 mod settings_window;
 mod sound;
+mod speech;
 mod summary_backend;
 mod theme;
 mod vision;

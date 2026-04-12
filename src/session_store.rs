@@ -1,6 +1,6 @@
 use rusqlite::{params, Connection, OptionalExtension};
 use screamer_core::ambient::{AmbientSessionState, CanonicalSegment, SummaryTemplate};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -163,6 +163,59 @@ impl SessionStore {
             ],
         )
         .map_err(|err| format!("Failed to update structured notes: {err}"))?;
+        Ok(())
+    }
+
+    pub fn rewrite_session_outputs(
+        &self,
+        session_id: i64,
+        title: &str,
+        live_notes: &str,
+        structured_notes: &str,
+        transcript_markdown: &str,
+        updated_at_ms: i64,
+    ) -> Result<(), String> {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        conn.execute(
+            "UPDATE sessions
+                SET title = ?2,
+                    live_notes = ?3,
+                    structured_notes = ?4,
+                    transcript_markdown = ?5,
+                    updated_at_ms = ?6
+              WHERE id = ?1",
+            params![
+                session_id,
+                title,
+                live_notes,
+                structured_notes,
+                transcript_markdown,
+                updated_at_ms,
+            ],
+        )
+        .map_err(|err| format!("Failed to rewrite session outputs: {err}"))?;
+        Ok(())
+    }
+
+    pub fn backup_to(&self, path: &Path) -> Result<(), String> {
+        let parent = path
+            .parent()
+            .ok_or_else(|| "Unable to resolve session backup directory".to_string())?;
+        std::fs::create_dir_all(parent)
+            .map_err(|err| format!("Failed to create session backup directory: {err}"))?;
+
+        let destination = path
+            .to_str()
+            .ok_or_else(|| "Session backup path must be valid UTF-8".to_string())?;
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        conn.execute("VACUUM main INTO ?1", params![destination])
+            .map_err(|err| format!("Failed to back up session database: {err}"))?;
         Ok(())
     }
 

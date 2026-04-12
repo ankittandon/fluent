@@ -69,10 +69,7 @@ pub fn log_ambient_session_report(
     eprintln!("title: {}", sanitize_log_header_value(title));
     eprintln!("started_at_ms: {started_at_ms}");
     eprintln!("ended_at_ms: {ended_at_ms}");
-    eprintln!(
-        "duration_ms: {}",
-        ended_at_ms.saturating_sub(started_at_ms)
-    );
+    eprintln!("duration_ms: {}", ended_at_ms.saturating_sub(started_at_ms));
     eprintln!(
         "summary_backend: {}",
         sanitize_log_header_value(summary_backend)

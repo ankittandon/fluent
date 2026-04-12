@@ -1,0 +1,3 @@
+Person A: Happy on the verse everybody be I'm over here with my baby.. .. He over there with his chicken wings, I've been a first friend and I'm over here with my beef and broccoli happy anniversary to us Thirty four years my bees and broccoli happy anniversary to us.. Vertical years of marriage.. to us, thirty-four years of marriage made the Lord bless us with many A marriage made of Lord bless us with many mouth.. .. All right, we about to get full.. Made a Lord bless us with many mouth.. What?. .. Alright, we about to get four.. Oh, we bought to get four.. Wait!. .. What?. Well, students should get teachers.. She was rushed to the hospital.. .. Wait!
+Person B: Well, students should be a teacher.. .. She was
+Person A: rushed to the hospital.

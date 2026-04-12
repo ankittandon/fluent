@@ -7,9 +7,12 @@ INFO_PLIST_TEMPLATE="${INFO_PLIST_TEMPLATE:-resources/Info.plist}"
 INFO_PLIST="$CONTENTS/Info.plist"
 MODELS_DIR="${MODELS_DIR:-models}"
 SUMMARY_MODELS_DIR="${SUMMARY_MODELS_DIR:-models/summary}"
+TTS_MODELS_DIR="${TTS_MODELS_DIR:-models/tts}"
+TTS_RUNTIME_DYLIB="${TTS_RUNTIME_DYLIB:-$TTS_MODELS_DIR/onnxruntime/libonnxruntime.dylib}"
 BIN_PATH="${BIN_PATH:-target/release/screamer}"
 SUMMARY_HELPER_PATH="${SUMMARY_HELPER_PATH:-target/release/screamer_summary_helper}"
 VISION_HELPER_PATH="${VISION_HELPER_PATH:-target/release/screamer_vision_helper}"
+TTS_HELPER_PATH="${TTS_HELPER_PATH:-target/release/screamer_tts_helper}"
 PLIST_BUDDY="${PLIST_BUDDY:-/usr/libexec/PlistBuddy}"
 SYSTEM_CODESIGN="${SYSTEM_CODESIGN:-/usr/bin/codesign}"
 SYSTEM_SECURITY="${SYSTEM_SECURITY:-/usr/bin/security}"
@@ -29,6 +32,10 @@ REQUIRED_SUMMARY_MODELS=(
 VISION_MODELS=(
     "gemma-3-4b-it-q4.gguf"
     "mmproj-gemma-3-4b-it-f16.gguf"
+)
+REQUIRED_TTS_MODELS=(
+    "0.onnx"
+    "0.bin"
 )
 
 detect_codesign_identity() {
@@ -110,15 +117,23 @@ if [ ! -f "$SUMMARY_HELPER_PATH" ]; then
     exit 1
 fi
 
+if [ ! -f "$TTS_HELPER_PATH" ]; then
+    echo "Error: TTS helper binary not found at $TTS_HELPER_PATH"
+    echo "Run cargo build --release and ensure the helper target builds successfully."
+    exit 1
+fi
+
 # Step 2: Assemble .app bundle.
 echo "Assembling app bundle..."
 rm -rf "$APP"
 mkdir -p "$CONTENTS/MacOS"
 mkdir -p "$CONTENTS/Resources/models"
 mkdir -p "$CONTENTS/Resources/models/summary"
+mkdir -p "$CONTENTS/Resources/models/tts"
 
 cp "$BIN_PATH" "$CONTENTS/MacOS/Screamer"
 cp "$SUMMARY_HELPER_PATH" "$CONTENTS/MacOS/screamer_summary_helper"
+cp "$TTS_HELPER_PATH" "$CONTENTS/MacOS/screamer_tts_helper"
 if [ -f "$VISION_HELPER_PATH" ]; then
     cp "$VISION_HELPER_PATH" "$CONTENTS/MacOS/screamer_vision_helper"
 fi
@@ -201,13 +216,61 @@ for model_name in "${VISION_MODELS[@]}"; do
     fi
 done
 
+if [ ! -d "$TTS_MODELS_DIR" ]; then
+    echo "Error: TTS models directory not found at $TTS_MODELS_DIR"
+    echo "Run ./download_model.sh tts or ./download_model.sh bundled first."
+    exit 1
+fi
+
+missing_tts_models=()
+for model_name in "${REQUIRED_TTS_MODELS[@]}"; do
+    model_path="$TTS_MODELS_DIR/$model_name"
+    if [ ! -f "$model_path" ]; then
+        missing_tts_models+=("$model_name")
+        continue
+    fi
+    if [ ! -s "$model_path" ]; then
+        echo "Error: bundled TTS model is empty: $model_path"
+        exit 1
+    fi
+
+    echo "Bundling TTS model: $model_name"
+    cp "$model_path" "$CONTENTS/Resources/models/tts/"
+done
+
+if [ "${#missing_tts_models[@]}" -ne 0 ]; then
+    echo "Error: missing required bundled TTS models:"
+    printf '  - %s\n' "${missing_tts_models[@]}"
+    echo "Run ./download_model.sh tts or ./download_model.sh bundled and try again."
+    exit 1
+fi
+
+COPIED_ONNX_DYLIBS=()
+if [ ! -f "$TTS_RUNTIME_DYLIB" ]; then
+    echo "Error: ONNX Runtime dylib not found at $TTS_RUNTIME_DYLIB"
+    echo "Run ./download_model.sh tts or ./download_model.sh tts-runtime and try again."
+    exit 1
+fi
+if [ ! -s "$TTS_RUNTIME_DYLIB" ]; then
+    echo "Error: ONNX Runtime dylib is empty: $TTS_RUNTIME_DYLIB"
+    exit 1
+fi
+
+echo "Bundling ONNX Runtime library: libonnxruntime.dylib"
+cp "$TTS_RUNTIME_DYLIB" "$CONTENTS/MacOS/libonnxruntime.dylib"
+COPIED_ONNX_DYLIBS+=("$CONTENTS/MacOS/libonnxruntime.dylib")
+
 if [ ! -x "$SYSTEM_CODESIGN" ]; then
     echo "Error: Apple codesign tool not found at $SYSTEM_CODESIGN"
     exit 1
 fi
 
 echo "Signing app bundle with Apple codesign..."
+for dylib in "${COPIED_ONNX_DYLIBS[@]}"; do
+    sign_target "$dylib"
+done
 sign_target "$CONTENTS/MacOS/screamer_summary_helper"
+sign_target "$CONTENTS/MacOS/screamer_tts_helper"
 if [ -f "$CONTENTS/MacOS/screamer_vision_helper" ]; then
     sign_target "$CONTENTS/MacOS/screamer_vision_helper"
 fi

@@ -15,15 +15,16 @@ use objc2::sel;
 use objc2::AnyThread;
 use objc2_app_kit::{
     NSBackingStoreType, NSBorderType, NSButton, NSButtonType, NSColor, NSControlStateValueOff,
-    NSControlStateValueOn, NSFocusRingType, NSFont, NSImageScaling, NSImageView, NSLineBreakMode,
-    NSPopUpButton, NSScrollView, NSSegmentedControl, NSSwitch, NSTextAlignment, NSTextField,
-    NSTextView, NSView, NSWindow, NSWindowStyleMask, NSWindowTitleVisibility,
+    NSControlStateValueOn, NSFocusRingType, NSFont, NSForegroundColorAttributeName, NSImageScaling,
+    NSImageView, NSLineBreakMode, NSPopUpButton, NSScrollView, NSSegmentedControl, NSSwitch,
+    NSTextAlignment, NSTextField, NSTextView, NSView, NSWindow, NSWindowStyleMask,
+    NSWindowTitleVisibility,
 };
 use objc2_core_foundation::{CGFloat, CGPoint, CGRect, CGSize};
 use objc2_foundation::{
     MainThreadMarker, NSAttributedString, NSAttributedStringMarkdownInterpretedSyntax,
     NSAttributedStringMarkdownParsingFailurePolicy, NSAttributedStringMarkdownParsingOptions,
-    NSString,
+    NSRange, NSString,
 };
 use screamer_core::ambient::{CanonicalSegment, SummaryTemplate};
 use std::cell::{Cell, RefCell};
@@ -1911,10 +1912,20 @@ fn render_markdown_text_view(text_view: &NSTextView, markdown: &str, appearance:
         None,
     ) {
         Ok(attributed) => unsafe {
-            text_view.setTextColor(Some(&theme::body_text(appearance)));
+            let text_color = theme::body_text(appearance);
+            text_view.setTextColor(Some(&text_color));
             if let Some(text_storage) = text_view.textStorage() {
                 text_storage.beginEditing();
                 text_storage.setAttributedString(&attributed);
+                let full_range = NSRange::new(0, text_storage.length());
+                if !full_range.is_empty() {
+                    let _: () = msg_send![
+                        &*text_storage,
+                        addAttribute: NSForegroundColorAttributeName,
+                        value: &*text_color,
+                        range: full_range
+                    ];
+                }
                 text_storage.endEditing();
             } else {
                 text_view.setString(&markdown_string);

@@ -6,6 +6,9 @@ pub const DEFAULT_BUNDLED_SUMMARY_MODEL_FILENAME: &str = "gemma-3-1b-it-q4_k_m.g
 pub const VISION_MODEL_FILENAME: &str = "gemma-3-4b-it-q4.gguf";
 pub const VISION_MMPROJ_FILENAME: &str = "mmproj-gemma-3-4b-it-f16.gguf";
 
+pub const TTS_MODEL_FILENAME: &str = "0.onnx";
+pub const TTS_VOICES_FILENAME: &str = "0.bin";
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SummaryModelInfo {
     pub id: &'static str,
@@ -79,6 +82,10 @@ pub fn current_bundle_summary_models_dir() -> Option<PathBuf> {
     current_bundle_models_dir().map(|dir| dir.join("summary"))
 }
 
+pub fn current_bundle_tts_models_dir() -> Option<PathBuf> {
+    current_bundle_models_dir().map(|dir| dir.join("tts"))
+}
+
 pub fn find_vision_model() -> Option<(PathBuf, PathBuf)> {
     let bundle_dir = current_bundle_summary_models_dir();
     let local_dir = PathBuf::from("models").join("summary");
@@ -89,6 +96,18 @@ pub fn find_vision_model() -> Option<(PathBuf, PathBuf)> {
         .or_else(|| resolve_existing_path(Some(&local_dir), VISION_MMPROJ_FILENAME))?;
 
     Some((model_path, mmproj_path))
+}
+
+pub fn find_tts_model() -> Option<(PathBuf, PathBuf)> {
+    let bundle_dir = current_bundle_tts_models_dir();
+    let local_dir = PathBuf::from("models").join("tts");
+
+    let model_path = resolve_existing_path(bundle_dir.as_deref(), TTS_MODEL_FILENAME)
+        .or_else(|| resolve_existing_path(Some(&local_dir), TTS_MODEL_FILENAME))?;
+    let voices_path = resolve_existing_path(bundle_dir.as_deref(), TTS_VOICES_FILENAME)
+        .or_else(|| resolve_existing_path(Some(&local_dir), TTS_VOICES_FILENAME))?;
+
+    Some((model_path, voices_path))
 }
 
 fn resolve_existing_path(base: Option<&Path>, filename: &str) -> Option<PathBuf> {
@@ -115,5 +134,11 @@ mod tests {
         let model = bundled_summary_model().unwrap();
         assert_eq!(model.id, DEFAULT_BUNDLED_SUMMARY_MODEL_ID);
         assert_eq!(model.filename, DEFAULT_BUNDLED_SUMMARY_MODEL_FILENAME);
+    }
+
+    #[test]
+    fn tts_model_filenames_match_kokoro_micro_defaults() {
+        assert_eq!(TTS_MODEL_FILENAME, "0.onnx");
+        assert_eq!(TTS_VOICES_FILENAME, "0.bin");
     }
 }

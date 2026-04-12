@@ -75,7 +75,7 @@ Screamer does not yet ship a Screamer-specific WER harness in this repo. Accurac
 | `medium.en` | High accuracy, higher latency | Higher accuracy |
 | `large-v3` | Highest accuracy, highest latency | Highest accuracy |
 
-All models are free to download with `./download_model.sh`. The bundled ambient-summary path uses a local Gemma 3 1B GGUF (`models/summary/gemma-3-1b-it-q4_k_m.gguf`) and runs it through a bundled `llama.cpp` helper with Metal offload on Apple Silicon when that artifact is present.
+All models are free to download with `./download_model.sh`. The bundled ambient-summary path uses a local Gemma 3 1B GGUF (`models/summary/gemma-3-1b-it-q4_k_m.gguf`) and runs it through a bundled `llama.cpp` helper with Metal offload on Apple Silicon when that artifact is present. The spoken screen-help path bundles Kokoro TTS (`models/tts/0.onnx` and `models/tts/0.bin`) plus ONNX Runtime (`models/tts/onnxruntime/libonnxruntime.dylib`) so the app can answer aloud without macOS system voices.
 
 ### Speed vs. the competition
 

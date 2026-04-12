@@ -1433,6 +1433,7 @@ impl App {
             mtm,
             // ── Dictation press ──
             move || {
+                crate::speech::stop();
                 // Clear any previous vision response
                 if let Ok(mut vs) = vision_state_dict.lock() {
                     *vs = crate::overlay::VisionOverlayState::Hidden;
@@ -1574,6 +1575,7 @@ impl App {
             },
             // ── Vision press: capture screenshot, then start recording ──
             move || {
+                crate::speech::stop();
                 // Clear any previous vision response
                 if let Ok(mut vs) = vision_state_vis_press.lock() {
                     *vs = crate::overlay::VisionOverlayState::Hidden;
@@ -1594,6 +1596,15 @@ impl App {
                         return;
                     }
                 }
+                crate::speech::warm_up();
+
+                let clear_vision_screenshot = || {
+                    if let Ok(mut ss) = vision_screenshot.lock() {
+                        if let Some(path) = ss.take() {
+                            let _ = std::fs::remove_file(path);
+                        }
+                    }
+                };
 
                 // Start recording (same flow as dictation)
                 if is_rec_vis_press
@@ -1604,10 +1615,12 @@ impl App {
                         permissions::MicrophonePermissionOutcome::Granted => {}
                         permissions::MicrophonePermissionOutcome::Prompted => {
                             is_rec_vis_press.store(false, Ordering::SeqCst);
+                            clear_vision_screenshot();
                             return;
                         }
                         permissions::MicrophonePermissionOutcome::Denied => {
                             is_rec_vis_press.store(false, Ordering::SeqCst);
+                            clear_vision_screenshot();
                             show_missing_microphone_permission_guidance();
                             return;
                         }
@@ -1630,6 +1643,8 @@ impl App {
                         session,
                     );
                     eprintln!("[screamer] Vision recording armed");
+                } else {
+                    clear_vision_screenshot();
                 }
             },
             // ── Vision release: stop recording, transcribe, send to LLM ──
@@ -1654,6 +1669,9 @@ impl App {
                             if sfx_vis_release.load(Ordering::Relaxed) {
                                 pending_sound_vis.store(true, Ordering::SeqCst);
                             }
+                            if let Some(path) = screenshot_path.as_ref() {
+                                let _ = std::fs::remove_file(path);
+                            }
                             if let Ok(mut vs) = vision_state_vis_release.lock() {
                                 *vs = crate::overlay::VisionOverlayState::Hidden;
                             }
@@ -1663,6 +1681,9 @@ impl App {
                             eprintln!("[screamer] Vision recording too short ({} samples), skipping", trimmed_len);
                             if sfx_vis_release.load(Ordering::Relaxed) {
                                 pending_sound_vis.store(true, Ordering::SeqCst);
+                            }
+                            if let Some(path) = screenshot_path.as_ref() {
+                                let _ = std::fs::remove_file(path);
                             }
                             if let Ok(mut vs) = vision_state_vis_release.lock() {
                                 *vs = crate::overlay::VisionOverlayState::Hidden;
@@ -1689,6 +1710,7 @@ impl App {
                     let vision_state = vision_state_vis_release.clone();
 
                     std::thread::spawn(move || {
+                        let mut should_play_completion_sound = true;
                         match t.transcribe_profiled(&samples[transcribe_window.range]) {
                             Ok(result) if !result.text.is_empty() => {
                                 eprintln!(
@@ -1698,12 +1720,12 @@ impl App {
                                 );
                                 logging::log_transcript("Vision transcript", &result.text);
 
-                                if let Some(screenshot_path) = screenshot_path {
+                                if let Some(screenshot_path) = screenshot_path.as_ref() {
                                     eprintln!("[screamer] Vision: asking model about screenshot...");
                                     let vision_t0 = std::time::Instant::now();
                                     match crate::vision::ask_about_screen(
                                         &result.text,
-                                        &screenshot_path,
+                                        screenshot_path,
                                     ) {
                                         Ok(response) => {
                                             eprintln!(
@@ -1712,6 +1734,14 @@ impl App {
                                                 response.len(),
                                                 response
                                             );
+                                            match crate::speech::speak(&response) {
+                                                Ok(()) => {
+                                                    should_play_completion_sound = false;
+                                                }
+                                                Err(err) => {
+                                                    eprintln!("[screamer] Vision speech error: {err}");
+                                                }
+                                            }
                                             if let Ok(mut vs) = vision_state.lock() {
                                                 *vs = crate::overlay::VisionOverlayState::Response(response);
                                             }
@@ -1723,7 +1753,6 @@ impl App {
                                             }
                                         }
                                     }
-                                    let _ = std::fs::remove_file(&screenshot_path);
                                 } else {
                                     eprintln!("[screamer] Vision release but no screenshot found");
                                     if let Ok(mut vs) = vision_state.lock() {
@@ -1747,8 +1776,11 @@ impl App {
                             }
                         }
 
-                        if sfx.load(Ordering::Relaxed) {
+                        if should_play_completion_sound && sfx.load(Ordering::Relaxed) {
                             pending_sound.store(true, Ordering::SeqCst);
+                        }
+                        if let Some(screenshot_path) = screenshot_path {
+                            let _ = std::fs::remove_file(&screenshot_path);
                         }
                     });
                 }
